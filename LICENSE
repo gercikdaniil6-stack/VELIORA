@@ -1,0 +1,29 @@
+Copyright (c) 2026 VELIORA. All rights reserved.
+
+The source code in this repository is published for transparency and review.
+No license is granted to copy, modify, merge, publish, distribute, sublicense
+or sell it, except for the rights GitHub's Terms of Service give to view and
+fork public repositories on GitHub.
+
+You may download, install and use the official VELIORA App installers
+published in this repository's Releases free of charge, for personal or
+commercial use.
+
+Third-party components keep their own licenses: see THIRD-PARTY-NOTICES.md and
+the license texts in src-tauri/components/licenses/. The cursor trail in
+src/components/SplashCursor/ is based on React Bits and is covered by its
+MIT + Commons Clause license (src/components/SplashCursor/LICENSE.md).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+---
+
+© 2026 VELIORA. Все права защищены. Исходный код открыт для ознакомления и
+проверки, но копировать, изменять и распространять его без разрешения нельзя
+(кроме просмотра и форка на GitHub по правилам GitHub). Официальные
+установщики из раздела Releases можно бесплатно скачивать, устанавливать и
+использовать. Сторонние компоненты распространяются по своим лицензиям.

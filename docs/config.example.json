@@ -1,0 +1,30 @@
+{
+  "tgws": {
+    "host": "127.0.0.1",
+    "port": 1443,
+    "secret": "<32 hex chars, generated on first start>",
+    "workerDomain": "",
+    "autoStart": false,
+    "verbose": false
+  },
+  "zapret": {
+    "strategy": "general (ALT).bat",
+    "autoStart": false,
+    "gameFilter": "off",
+    "gameTcp": "1024-65535",
+    "gameUdp": "1024-65535",
+    "ipsetMode": "basic",
+    "fakeDiscord": null,
+    "fakeGame": null
+  },
+  "app": {
+    "launchAtLogin": false,
+    "silentStart": false,
+    "tray": true,
+    "closeToTray": true,
+    "hideTaskbar": false,
+    "autoCheckUpdates": true,
+    "showSplash": true,
+    "reduceTransparency": false
+  }
+}

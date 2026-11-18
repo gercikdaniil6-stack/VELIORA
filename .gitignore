@@ -1,0 +1,35 @@
+# dependencies and build output
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# local tooling and editor state
+.claude/
+.vscode/
+.idea/
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# secrets and personal data — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.keystore
+config.json
+!src-tauri/components/components.json
+proxy-snapshot.json
+
+# promo media (large, published separately)
+docs/promo/
+
+# local release checklist
+release-files.txt

@@ -1,0 +1,144 @@
+/* VELIORA design tokens — see docs/DESIGN_SYSTEM.md.
+   The theme engine (src/theme/engine.ts) overwrites these on :root for the active
+   theme and the user's appearance settings. The values below are the brand
+   default (Liquid Glass Dark) so the first paint is already on-brand. */
+:root {
+  /* Scene */
+  --bg: #0e1220;
+  --bg-a: #141a29;
+  --bg-b: #0b0e17;
+  --blob-1: rgba(101, 169, 255, 0.2);
+  --blob-2: rgba(169, 155, 255, 0.17);
+  --blob-3: rgba(76, 214, 255, 0.09);
+  --blob-4: rgba(255, 255, 255, 0.04);
+  --vignette: rgba(4, 6, 12, 0.5);
+
+  /* Ink (hairlines, hover tints), fill (glass whitening), spec (light reflections) */
+  --ink: #ffffff;
+  --fill: #ffffff;
+  --fill-k: 1;
+  --spec: #ffffff;
+  --spec-2: #dfe6f3;
+  --well: #080c16;
+  --well-k: 1;
+  --shade: #04070e;
+
+  /* Text */
+  --text-1: #f4f7fc;
+  --text-2: #a7b4c9;
+  --text-3: rgba(167, 180, 201, 0.62);
+  --text-on-accent: #0c1222;
+  --code: #dbe6ff;
+
+  /* Accent: the two ribbons of the logo meeting */
+  --accent-1: #8dbdff;
+  --accent-2: #65a9ff;
+  --accent-3: #a99bff;
+  --grad-brand: linear-gradient(120deg, var(--accent-1) 0%, var(--accent-2) 45%, var(--accent-3) 100%);
+  --grad-line: linear-gradient(90deg, var(--accent-1), var(--accent-3));
+
+  /* Status */
+  --ok: #7fdcc0;
+  --warn: #f2c98b;
+  --bad: #ff98a8;
+  --bad-text: #ffd3da;
+  --on-bad: #2a0f16;
+
+  /* Surfaces */
+  --surface: rgba(24, 31, 48, 0.44);
+  --glass-tint: var(--surface);
+  --glass-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.066) 0%, rgba(255, 255, 255, 0.026) 100%);
+  --glass-fill-strong: linear-gradient(180deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.045) 100%);
+  --glass-border: rgba(255, 255, 255, 0.085);
+  --glass-border-strong: rgba(255, 255, 255, 0.14);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  --rim: rgba(255, 255, 255, 0.18);
+  --blur: 28px;
+  --glass-blur: blur(var(--blur)) saturate(150%);
+  --menu-bg: #19213a;
+  --orb-bg: #151d30;
+  --titlebar-bg: linear-gradient(180deg, rgba(16, 21, 33, 0.55), rgba(16, 21, 33, 0.2));
+  --sidebar-bg: linear-gradient(180deg, rgba(21, 30, 48, 0.35), rgba(16, 21, 33, 0.15));
+  --scrim: rgba(6, 9, 16, 0.55);
+  --shadow-1: 0 1px 2px rgba(4, 7, 14, 0.3), 0 8px 24px rgba(4, 7, 14, 0.22);
+  --shadow-2: 0 2px 6px rgba(4, 7, 14, 0.35), 0 24px 60px rgba(4, 7, 14, 0.45);
+  --glow-k: 1;
+
+  /* Legacy aliases (brand palette names used across the stylesheets) */
+  --c-midnight: var(--bg);
+  --c-deep-navy: var(--bg-a);
+  --c-glass: var(--menu-bg);
+  --c-ice: var(--accent-1);
+  --c-electric: var(--accent-2);
+  --c-lavender: var(--accent-3);
+  --c-soft-white: var(--text-1);
+  --c-secondary: var(--text-2);
+
+  /* Radii (scaled by the engine) */
+  --r-xs: 8px;
+  --r-sm: 12px;
+  --r-md: 16px;
+  --r-lg: 22px;
+  --r-xl: 28px;
+  --r-pill: 999px;
+
+  /* Spacing (4-pt) */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+
+  /* Type */
+  --font: 'Manrope Variable', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-20: 20px;
+  --fs-28: 28px;
+  --fs-36: 36px;
+
+  /* Motion (scaled by the engine's animation speed) */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --t-fast: 140ms;
+  --t-med: 260ms;
+  --t-slow: 520ms;
+
+  /* Layout */
+  --titlebar-h: 44px;
+  --sidebar-w: 236px;
+
+  color-scheme: dark;
+}
+
+:root[data-mode='light'] { color-scheme: light; }
+
+/* Liquid Glass off: dense, opaque surfaces (also the accessibility mode) */
+:root[data-glass='off'] {
+  --glass-blur: none;
+}
+:root[data-glass='off'] .glass { background: var(--surface-solid, var(--menu-bg)); }
+
+/* Reduced / off motion: transitions become instant, decorative animation stops */
+:root[data-motion='reduced'] *, :root[data-motion='reduced'] *::before, :root[data-motion='reduced'] *::after,
+:root[data-motion='off'] *, :root[data-motion='off'] *::before, :root[data-motion='off'] *::after {
+  animation-duration: 1ms !important;
+  animation-iteration-count: 1 !important;
+  scroll-behavior: auto !important;
+}
+:root[data-motion='off'] *, :root[data-motion='off'] *::before, :root[data-motion='off'] *::after { transition-duration: 1ms !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-motion-override]) {
+    --t-fast: 1ms;
+    --t-med: 1ms;
+    --t-slow: 1ms;
+  }
+}

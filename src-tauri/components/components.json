@@ -1,0 +1,14 @@
+{
+  "zapret": {
+    "version": "1.10.4",
+    "asset": "zapret-discord-youtube-1.10.4.zip",
+    "sha256": "291af673bd0238506f9548e0e94ca0abf244000f4c9a06960544fb01c5f97b34",
+    "source": "https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.10.4/zapret-discord-youtube-1.10.4.zip"
+  },
+  "tgws": {
+    "version": "1.11.4",
+    "source": "https://github.com/Flowseal/tg-ws-proxy (__version__ 1.11.4)",
+    "sha256": "44e6b07ce6a21d0cb7990043c6c0a7ab70e500033383287b55bcf68c6a7d1e32",
+    "build": "PyInstaller 6.16.0, onefile, entry proxy.tg_ws_proxy:main"
+  }
+}

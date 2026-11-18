@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="54 66.5 410 410" width="512" height="512"><defs>
+<linearGradient id="tL" x1="120" y1="104" x2="292" y2="432" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#A3AEC2"/><stop offset="1" stop-color="#5A6680"/></linearGradient>
+<linearGradient id="tR" x1="420" y1="104" x2="300" y2="366" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#BCC3D1"/><stop offset="1" stop-color="#727C93"/></linearGradient>
+<clipPath id="tC"><path d="M60 114 C96 107 132 104 160 105 C186 106 204 120 216 142 C232 172 248 214 258 252 C272 298 310 334 356 344 C364 346 365 356 361 364 C340 408 300 432 256 430 C222 428 198 410 182 378 C146 304 100 196 60 114 Z"/></clipPath>
+</defs>
+<path d="M318 110 C362 106 410 104 448 106 C455 106 458 111 456 118 C432 196 400 276 362 340 C354 354 346 367 337 377 C308 398 264 398 240 380 C228 346 240 292 258 252 C268 208 288 150 318 110 Z" fill="url(#tR)"/>
+<path d="M60 114 C96 107 132 104 160 105 C186 106 204 120 216 142 C232 172 248 214 258 252 C272 298 310 334 356 344 C364 346 365 356 361 364 C340 408 300 432 256 430 C222 428 198 410 182 378 C146 304 100 196 60 114 Z" fill="url(#tL)"/>
+<path d="M318 110 C362 106 410 104 448 106 C455 106 458 111 456 118 C432 196 400 276 362 340 C354 354 346 367 337 377 C308 398 264 398 240 380 C228 346 240 292 258 252 C268 208 288 150 318 110 Z" fill="#E8EBF1" clip-path="url(#tC)"/></svg>
