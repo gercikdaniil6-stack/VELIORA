@@ -12,11 +12,11 @@ Telegram и свободный интернет в одном окне — дл�
 
 ![VELIORA App — главный экран](docs/img/v21-home-light.png)
 
-## В разработке — VELIORA 2.2.5
+## Предварительный выпуск — VELIORA 2.2.5
 
-Готовим обновление для Windows x64. В нём появятся автоматический подбор прокси для Telegram, каталог с резервными источниками, дополнительные режимы для Discord и более надёжное восстановление системного прокси.
+В обновлении для Windows x64 доступны автоматический подбор прокси для Telegram, каталог с резервными источниками, дополнительные режимы для Discord и более надёжное восстановление системного прокси.
 
-Сборка 2.2.5 проходит проверку. Для публичной загрузки пока доступна [версия 2.1.0](https://github.com/gercikdaniil6-stack/VELIORA/releases/tag/v2.1.0). О выходе обновления сообщим в [insomnia project](https://t.me/insomniatype).
+[**Скачать VELIORA 2.2.5 для Windows x64**](https://github.com/gercikdaniil6-stack/VELIORA/releases/download/v2.2.5/VELIORA_App_2.2.5_x64-setup.exe?v=225) · [Описание предварительного выпуска](https://github.com/gercikdaniil6-stack/VELIORA/releases/tag/v2.2.5).
 
 ## Возможности
 
