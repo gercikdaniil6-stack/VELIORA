@@ -25,6 +25,7 @@
     "hideTaskbar": false,
     "autoCheckUpdates": true,
     "showSplash": true,
-    "reduceTransparency": false
+    "reduceTransparency": false,
+    "appAutoCheckUpdates": true
   }
 }

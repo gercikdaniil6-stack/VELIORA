@@ -37,8 +37,15 @@ pub fn hidden(program: impl AsRef<OsStr>) -> Command {
 }
 
 pub fn system32(exe: &str) -> PathBuf {
-    let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    root.join("System32").join(exe)
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 32768];
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let dir = if len == 0 || len >= buf.len() {
+        PathBuf::from(r"C:\Windows\System32")
+    } else {
+        PathBuf::from(String::from_utf16_lossy(&buf[..len]))
+    };
+    dir.join(exe)
 }
 
 /// Runs a system tool hidden and returns (exit code, combined output).
@@ -119,6 +126,7 @@ pub fn relaunch_elevated(args: &[String]) -> Result<(), u32> {
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     pub pid: u32,
+    pub parent: u32,
     pub name: String,
 }
 
@@ -137,7 +145,7 @@ pub fn processes() -> Vec<ProcInfo> {
         if Process32FirstW(snap, &mut e) != 0 {
             loop {
                 let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-                out.push(ProcInfo { pid: e.th32ProcessID, name: String::from_utf16_lossy(&e.szExeFile[..len]) });
+                out.push(ProcInfo { pid: e.th32ProcessID, parent: e.th32ParentProcessID, name: String::from_utf16_lossy(&e.szExeFile[..len]) });
                 if Process32NextW(snap, &mut e) == 0 {
                     break;
                 }
@@ -213,12 +221,16 @@ impl Job {
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
+            let configured = SetInformationJobObject(
                 h,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
+            if configured == 0 {
+                CloseHandle(h);
+                return None;
+            }
             Some(Job(h))
         }
     }
@@ -257,6 +269,10 @@ pub struct ServiceInfo {
     /// 2 auto, 3 manual, 4 disabled (0/1 for drivers)
     pub start_type: u32,
     pub binary: String,
+    pub account: String,
+    pub pid: u32,
+    pub kind: u32,
+    pub accepted: u32,
 }
 
 impl ServiceInfo {
@@ -269,8 +285,6 @@ const SC_MANAGER_CONNECT: u32 = 0x0001;
 const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
 const SERVICE_QUERY_CONFIG: u32 = 0x0001;
 const SERVICE_QUERY_STATUS: u32 = 0x0004;
-const SERVICE_STOP: u32 = 0x0020;
-const DELETE: u32 = 0x0001_0000;
 
 struct Sc(*mut c_void);
 impl Drop for Sc {
@@ -292,24 +306,91 @@ fn open_service(mgr: &Sc, name: &str, access: u32) -> Option<Sc> {
     (!h.is_null()).then(|| Sc(h as _))
 }
 
+fn inspect_service(svc: &Sc, name: &str) -> Option<ServiceInfo> {
+    use windows_sys::Win32::System::Services::*;
+    unsafe {
+        let mut status: SERVICE_STATUS_PROCESS = std::mem::zeroed();
+        let mut needed = 0u32;
+        if QueryServiceStatusEx(svc.0 as _, SC_STATUS_PROCESS_INFO, (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32, &mut needed) == 0 { return None; }
+        let mut buffer = [0usize; 1024];
+        if QueryServiceConfigW(svc.0 as _, buffer.as_mut_ptr().cast(), std::mem::size_of_val(&buffer) as u32, &mut needed) == 0 { return None; }
+        let cfg = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
+        Some(ServiceInfo {
+            name: name.into(), display: from_wide_ptr(cfg.lpDisplayName), state: status.dwCurrentState,
+            start_type: cfg.dwStartType, binary: from_wide_ptr(cfg.lpBinaryPathName), account: from_wide_ptr(cfg.lpServiceStartName),
+            pid: status.dwProcessId, kind: status.dwServiceType, accepted: status.dwControlsAccepted,
+        })
+    }
+}
+
 pub fn service(name: &str) -> Option<ServiceInfo> {
-    use windows_sys::Win32::System::Services::{QueryServiceConfigW, QueryServiceStatus, QUERY_SERVICE_CONFIGW, SERVICE_STATUS};
     let mgr = scm(SC_MANAGER_CONNECT)?;
     let svc = open_service(&mgr, name, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG)?;
-    unsafe {
-        let mut st: SERVICE_STATUS = std::mem::zeroed();
-        QueryServiceStatus(svc.0 as _, &mut st);
-        let mut buf = vec![0u8; 8192];
-        let mut needed = 0u32;
-        let (start_type, binary) =
-            if QueryServiceConfigW(svc.0 as _, buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW, buf.len() as u32, &mut needed) != 0 {
-                let cfg = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-                (cfg.dwStartType, from_wide_ptr(cfg.lpBinaryPathName))
-            } else {
-                (0, String::new())
-            };
-        Some(ServiceInfo { name: name.to_string(), display: String::new(), state: st.dwCurrentState, start_type, binary })
+    inspect_service(&svc, name)
+}
+
+pub fn stop_verified_service(expected: &ServiceInfo) -> Result<(), String> {
+    use windows_sys::Win32::System::Services::*;
+    let mgr = scm(SC_MANAGER_CONNECT).ok_or("Windows не разрешила открыть диспетчер служб.")?;
+    let svc = open_service(&mgr, &expected.name, SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG)
+        .ok_or("Windows не разрешила остановить службу.")?;
+    let actual = inspect_service(&svc, &expected.name).ok_or("Служба изменилась. Выполните проверку повторно.")?;
+    if actual.pid != expected.pid || actual.binary != expected.binary || actual.account != expected.account ||
+        actual.kind != SERVICE_WIN32_OWN_PROCESS || actual.state != SERVICE_RUNNING || actual.accepted & SERVICE_ACCEPT_STOP == 0 {
+        return Err("Служба изменилась. Выполните проверку повторно.".into());
     }
+    let mut status = unsafe { std::mem::zeroed::<SERVICE_STATUS>() };
+    if unsafe { ControlService(svc.0 as _, SERVICE_CONTROL_STOP, &mut status) } == 0 {
+        return Err(format!("Windows не остановила службу: {}", std::io::Error::last_os_error()));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        if inspect_service(&svc, &expected.name).is_some_and(|s| s.state == SERVICE_STOPPED) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("Служба ещё останавливается. Подождите и повторите включение.".into())
+}
+
+pub fn uses_windivert(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if snap == INVALID_HANDLE_VALUE { return None; }
+        let mut module = std::mem::zeroed::<MODULEENTRY32W>();
+        module.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        if Module32FirstW(snap, &mut module) == 0 {
+            CloseHandle(snap);
+            return None;
+        }
+        let found = loop {
+            if from_wide_ptr(module.szModule.as_ptr()).eq_ignore_ascii_case("WinDivert.dll") { break true; }
+            if Module32NextW(snap, &mut module) == 0 { break false; }
+        };
+        CloseHandle(snap);
+        Some(found)
+    }
+}
+
+pub fn verified_signature(path: &Path) -> bool {
+    use windows_sys::Win32::Security::WinTrust::*;
+    let name = wide(path.as_os_str());
+    let file = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32, pcwszFilePath: name.as_ptr(),
+        ..Default::default()
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 { pFile: &file as *const _ as *mut _ },
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    unsafe { WinVerifyTrustEx(null_mut(), &mut action, &mut data) == 0 }
 }
 
 pub fn services_all() -> Vec<ServiceInfo> {
@@ -346,27 +427,14 @@ pub fn services_all() -> Vec<ServiceInfo> {
                 state: it.ServiceStatusProcess.dwCurrentState,
                 start_type: 0,
                 binary: String::new(),
+                account: String::new(),
+                pid: it.ServiceStatusProcess.dwProcessId,
+                kind: it.ServiceStatusProcess.dwServiceType,
+                accepted: it.ServiceStatusProcess.dwControlsAccepted,
             });
         }
     }
     out
-}
-
-pub fn service_stop(name: &str) -> bool {
-    use windows_sys::Win32::System::Services::{ControlService, SERVICE_CONTROL_STOP, SERVICE_STATUS};
-    let Some(mgr) = scm(SC_MANAGER_CONNECT) else { return false };
-    let Some(svc) = open_service(&mgr, name, SERVICE_STOP | SERVICE_QUERY_STATUS) else { return false };
-    unsafe {
-        let mut st: SERVICE_STATUS = std::mem::zeroed();
-        ControlService(svc.0 as _, SERVICE_CONTROL_STOP, &mut st) != 0
-    }
-}
-
-pub fn service_delete(name: &str) -> bool {
-    use windows_sys::Win32::System::Services::DeleteService;
-    let Some(mgr) = scm(SC_MANAGER_CONNECT) else { return false };
-    let Some(svc) = open_service(&mgr, name, DELETE) else { return false };
-    unsafe { DeleteService(svc.0 as _) != 0 }
 }
 
 /// Normalises an SCM binary path ("\??\C:\x.sys", quoted, with args) to a file path.
@@ -390,6 +458,7 @@ pub struct Adapter {
     pub description: String,
     pub up: bool,
     pub if_type: u32,
+    pub mtu: u32,
 }
 
 pub fn adapters() -> Vec<Adapter> {
@@ -413,6 +482,7 @@ pub fn adapters() -> Vec<Adapter> {
                 description: unsafe { from_wide_ptr(a.Description) },
                 up: a.OperStatus == 1,
                 if_type: a.IfType,
+                mtu: a.Mtu,
             });
             p = a.Next;
         }
@@ -448,72 +518,119 @@ pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// %ProgramData%\VELIORA — the elevated-only working area for Zapret.
-pub fn program_data() -> PathBuf {
-    std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")).join("VELIORA")
+fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
+    use windows_sys::Win32::{System::Com::CoTaskMemFree, UI::Shell::SHGetKnownFolderPath};
+    unsafe {
+        let mut path = null_mut();
+        if SHGetKnownFolderPath(id, 0, null_mut(), &mut path) < 0 || path.is_null() {
+            return None;
+        }
+        let dir = PathBuf::from(from_wide_ptr(path));
+        CoTaskMemFree(path.cast());
+        Some(dir)
+    }
 }
 
-/// Restricts a folder to SYSTEM + Administrators (full) and Users (read/execute),
-/// so nothing unelevated can swap the binaries VELIORA runs with admin rights.
-pub fn lock_down(dir: &Path) -> bool {
+/// Resolve through Windows, ignoring caller-controlled environment variables.
+pub fn program_data() -> PathBuf {
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramData;
+    known_folder(&FOLDERID_ProgramData).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")).join("VELIORA")
+}
+
+pub fn trusted_install() -> bool {
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
+    let Some(base)=known_folder(&FOLDERID_ProgramFiles).and_then(|path| path.canonicalize().ok()) else{return false;};
+    std::env::current_exe().ok().and_then(|path|path.canonicalize().ok())
+      .is_some_and(|exe| exe.starts_with(base))
+}
+
+/// Create the root with its final permissions in one operation, including on first launch.
+pub fn create_protected_dir(dir: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
-    // Exactly this DACL on the root, not inherited from ProgramData:
-    // SYSTEM and Administrators full control, Users read & execute; all inheritable.
-    let sddl = wide("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)");
-    let ok = unsafe {
-        let mut sd: *mut c_void = null_mut();
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let descriptor = wide("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)");
+    let path = wide(dir.as_os_str());
+    unsafe {
+        let mut sd = null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut(),
+        ) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let created = CreateDirectoryW(path.as_ptr(), &attrs) != 0;
+        let error = GetLastError();
+        LocalFree(sd);
+        if created || error == ERROR_ALREADY_EXISTS {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(error as i32))
+        }
+    }
+}
+
+fn protected_acl(path: &Path) -> bool {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetAce, IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
+    };
+
+    unsafe {
+        let mut owner = null_mut();
+        let mut dacl = null_mut();
+        let mut sd = null_mut();
+        if GetNamedSecurityInfoW(wide(path.as_os_str()).as_ptr(), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &mut owner, null_mut(),
+            &mut dacl, null_mut(), &mut sd) != 0 {
             return false;
         }
-        let mut present = 0;
-        let mut defaulted = 0;
-        let mut dacl: *mut ACL = null_mut();
-        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted);
-        let path = wide(dir.as_os_str());
-        let r = SetNamedSecurityInfoW(
-            path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            dacl,
-            null(),
-        );
-        windows_sys::Win32::Foundation::LocalFree(sd);
-        r == 0
-    };
-    // Everything inside simply inherits the root's ACL.
-    let children = format!("{}\\*", dir.to_string_lossy().trim_end_matches('\\'));
-    let (code, _) = run_tool("icacls.exe", &[&children, "/reset", "/T", "/C", "/Q"]);
-    ok && code == 0
+        let trusted = |sid: PSID| !sid.is_null()
+            && (IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                || IsWellKnownSid(sid, WinLocalSystemSid) != 0);
+        let valid = trusted(owner) && !dacl.is_null() && (0..u32::from((*dacl).AceCount)).all(|index| {
+            let mut raw = null_mut();
+            if GetAce(dacl, index, &mut raw) == 0 || raw.is_null() {
+                return false;
+            }
+            let ace = &*raw.cast::<ACCESS_ALLOWED_ACE>();
+            match ace.Header.AceType {
+                0 => ace.Mask & !0x0012_00a9 == 0
+                    || trusted(std::ptr::addr_of!(ace.SidStart).cast_mut().cast()),
+                1 => true, // ACCESS_DENIED_ACE cannot grant write access.
+                _ => false,
+            }
+        });
+        LocalFree(sd);
+        valid
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn lock_down_sets_inherited_read_only_for_users() {
-        let d = std::env::temp_dir().join("veliora-acl-unit");
-        // A previous run leaves the folder read-only for us: hand it back to Temp's ACL first.
-        let reset = |d: &std::path::Path| {
-            super::run_tool("icacls.exe", &[&d.to_string_lossy(), "/reset", "/T", "/C", "/Q"]);
-            let _ = std::fs::remove_dir_all(d);
-        };
-        reset(&d);
-        std::fs::create_dir_all(d.join("sub")).unwrap();
-        std::fs::write(d.join("sub").join("a.txt"), "x").unwrap();
-        assert!(super::lock_down(&d));
-        let (_, acl) = super::run_tool("icacls.exe", &[&d.join("sub").join("a.txt").to_string_lossy()]);
-        println!("{acl}");
-        // Users read-only inherited; no explicit/extra user ACE
-        assert!(acl.contains("S-1-5-32-545") || acl.contains("(I)(RX)"));
-        let aces = acl.lines().filter(|l| l.contains(":(")).count();
-        assert_eq!(aces, 3, "expected exactly SYSTEM, Administrators, Users: {acl}");
-        // Unelevated (this test): reading works, writing is denied.
-        assert_eq!(std::fs::read_to_string(d.join("sub").join("a.txt")).unwrap(), "x");
-        assert!(std::fs::write(d.join("sub").join("a.txt"), "y").is_err());
-        reset(&d);
+/// Validate the owner and write permissions before trusting an existing runtime.
+/// An ordinary user could otherwise retain control as the owner after an ACL reset.
+pub fn protected_tree(root: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(root)?;
+    if meta.file_attributes() & 0x400 != 0 || !protected_acl(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Рабочая папка содержит ссылку, файл с недоверенным владельцем или разрешением на запись.",
+        ));
     }
+    if meta.is_dir() {
+        for child in std::fs::read_dir(root)? {
+            protected_tree(&child?.path())?;
+        }
+    }
+    Ok(())
 }

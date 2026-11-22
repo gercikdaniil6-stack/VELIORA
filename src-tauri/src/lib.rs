@@ -1,7 +1,12 @@
+mod app_updater;
+mod managed_sites;
+mod zapret_conflicts;
 mod autorun;
+mod catalog;
 mod component;
 mod config;
 mod diag;
+mod discord;
 mod logs;
 mod proxy;
 mod tester;
@@ -55,6 +60,8 @@ struct AppState {
     tray: Mutex<Option<TrayItems>>,
     quitting: AtomicBool,
     shut_down: AtomicBool,
+    network_maintenance: Mutex<()>,
+    zapret_recovery_used: AtomicBool,
 }
 
 impl AppState {
@@ -72,6 +79,8 @@ impl AppState {
             tray: Mutex::new(None),
             quitting: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
+            network_maintenance: Mutex::new(()),
+            zapret_recovery_used: AtomicBool::new(false),
         }
     }
     fn resources(&self) -> PathBuf {
@@ -143,6 +152,9 @@ async fn app_info(app: AppHandle) -> AppInfo {
 }
 
 fn relaunch(app: &AppHandle, elevated: bool) -> Result<(), String> {
+    if elevated && !win::trusted_install() {
+        return Err("Для запуска с повышенными правами установите VELIORA в Program Files.".into());
+    }
     // The new instance waits for this one to exit (single-instance lock) and
     // never re-asks for elevation itself.
     let args = vec![format!("--wait-parent={}", std::process::id()), "--no-elevate".to_string()];
@@ -194,7 +206,16 @@ struct ConfigResult {
 
 #[tauri::command]
 async fn config_set(app: AppHandle, config: Config) -> Result<ConfigResult, String> {
-    blocking(move || apply_config(&app, config)).await
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
+        let mut config = config;
+        let current = st.cfg();
+        config.zapret.managed_sites = current.zapret.managed_sites;
+        config.zapret.managed_services = current.zapret.managed_services;
+        config.zapret.managed_revision = current.zapret.managed_revision;
+        apply_config(&app, config)
+    }).await
 }
 
 fn apply_config(app: &AppHandle, mut next: Config) -> Result<ConfigResult, String> {
@@ -207,6 +228,17 @@ fn apply_config(app: &AppHandle, mut next: Config) -> Result<ConfigResult, Strin
         next.app.hide_taskbar = false;
     }
     let prev = st.cfg();
+    if next.zapret.strategy != prev.zapret.strategy || next.zapret.managed_sites != prev.zapret.managed_sites || next.zapret.managed_services != prev.zapret.managed_services {
+        if let Some(file) = &next.zapret.strategy {
+            zapret::build_args(&zapret::active_dir(&st.resources()), file, &next.zapret)?;
+        }
+    }
+    if next.zapret.discord_udp != config::DiscordUdp::Bundle
+        && (next.zapret.discord_udp != prev.zapret.discord_udp || next.zapret.strategy != prev.zapret.strategy) {
+        if let Some(file) = &next.zapret.strategy {
+            zapret::build_args(&zapret::active_dir(&st.resources()), file, &next.zapret)?;
+        }
+    }
     if next.app.launch_at_login != prev.app.launch_at_login {
         let r = if next.app.launch_at_login { autorun::enable() } else { autorun::disable() };
         r?;
@@ -230,7 +262,7 @@ fn apply_config(app: &AppHandle, mut next: Config) -> Result<ConfigResult, Strin
         restart.push("tgws");
     }
     let z = (&next.zapret, &prev.zapret);
-    let zap_changed = z.0.strategy != z.1.strategy || z.0.game_filter != z.1.game_filter || z.0.game_tcp != z.1.game_tcp || z.0.game_udp != z.1.game_udp || z.0.ipset_mode != z.1.ipset_mode || z.0.fake_discord != z.1.fake_discord || z.0.fake_game != z.1.fake_game;
+    let zap_changed = z.0.strategy != z.1.strategy || z.0.game_filter != z.1.game_filter || z.0.game_tcp != z.1.game_tcp || z.0.game_udp != z.1.game_udp || z.0.ipset_mode != z.1.ipset_mode || z.0.fake_discord != z.1.fake_discord || z.0.fake_game != z.1.fake_game || z.0.discord_udp != z.1.discord_udp;
     if zap_changed && st.zapret.alive() {
         restart.push("zapret");
     }
@@ -243,6 +275,8 @@ fn apply_config(app: &AppHandle, mut next: Config) -> Result<ConfigResult, Strin
 async fn config_factory_reset(app: AppHandle) -> Result<Config, String> {
     blocking(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
+        if st.tester.is_running() || st.quitting.load(Ordering::SeqCst) { return Err("Дождитесь окончания текущей операции.".into()); }
         tgws::stop(&st.tgws);
         zapret::stop(&st.zapret);
         st.tester.reset();
@@ -251,7 +285,10 @@ async fn config_factory_reset(app: AppHandle) -> Result<Config, String> {
         // Keep the look the user chose; everything else back to defaults.
         let prev = st.cfg();
         fresh.app.reduce_transparency = prev.app.reduce_transparency;
-        fresh.appearance = prev.appearance.clone();
+        fresh.appearance = prev.appearance;
+        fresh.zapret.managed_sites = prev.zapret.managed_sites;
+        fresh.zapret.managed_services = prev.zapret.managed_services;
+        fresh.zapret.managed_revision = prev.zapret.managed_revision;
         apply_config(&app, fresh).map(|r| r.config)
     })
     .await
@@ -346,15 +383,97 @@ async fn tgws_regenerate_secret(app: AppHandle) -> Result<String, String> {
 
 // ── Zapret ────────────────────────────────────────────────────────────────
 
+fn start_zapret(app: &AppHandle) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    let cfg = st.cfg().zapret;
+    let mut resolved = false;
+    if cfg.auto_resolve_conflicts && !st.zapret.alive() && zapret_conflicts::has_approvals() &&
+        !zapret_conflicts::scan(None, false).is_empty() {
+        let file = cfg.strategy.as_deref().ok_or("Сначала выберите стратегию Zapret.")?;
+        let resources = st.resources();
+        zapret::prepare(&resources)?;
+        zapret::build_args(&zapret::active_dir(&resources), file, &cfg)?;
+        let _ = app.emit("zapret://maintenance", "Обнаружен конфликт Zapret. Подготавливаем подключение…");
+        resolved = zapret_conflicts::resolve_approved()?;
+    }
+    zapret::start(&st.zapret, &st.resources(), &cfg)?;
+    if resolved { let _ = app.emit("zapret://maintenance", "Конфликт устранён. VELIORA готова к работе."); }
+    Ok(())
+}
+
+#[tauri::command]
+async fn zapret_conflict_scan(app: AppHandle) -> zapret_conflicts::Inspection {
+    blocking(move || zapret_conflicts::inspect(app.state::<AppState>().zapret.status().pid)).await
+}
+
+#[tauri::command]
+async fn zapret_conflict_resolve(app: AppHandle, token: String, remember: bool) -> Result<CoreStatus, String> {
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Другая операция Zapret уже выполняется.")?;
+        if st.tester.is_running() || st.zapret.alive() || st.quitting.load(Ordering::SeqCst) {
+            return Err("Состояние Zapret изменилось. Выполните проверку повторно.".into());
+        }
+        let cfg = st.cfg().zapret;
+        let file = cfg.strategy.as_deref().ok_or("Сначала выберите стратегию Zapret.")?;
+        let resources = st.resources();
+        zapret::prepare(&resources)?;
+        zapret::build_args(&zapret::active_dir(&resources), file, &cfg)?;
+        let _ = app.emit("zapret://maintenance", "Обнаружен конфликт Zapret. Подготавливаем подключение…");
+        zapret_conflicts::resolve(&token, remember)?;
+        st.zapret_recovery_used.store(false, Ordering::SeqCst);
+        start_zapret(&app)?;
+        let _ = app.emit("zapret://maintenance", "Конфликт устранён. VELIORA готова к работе.");
+        Ok(st.zapret.status())
+    }).await
+}
+
+#[tauri::command]
+async fn zapret_conflict_forget(app: AppHandle) -> Result<(), String> {
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Другая операция Zapret уже выполняется.")?;
+        zapret_conflicts::forget()
+    }).await
+}
+
+pub(crate) fn recover_zapret(app: &AppHandle, generation: u64) {
+    let st = app.state::<AppState>();
+    if !st.cfg().zapret.auto_resolve_conflicts || st.quitting.load(Ordering::SeqCst) { return; }
+    if st.zapret_recovery_used.swap(true, Ordering::SeqCst) {
+        let _ = app.emit("zapret://maintenance", "Zapret завершился повторно. Автовосстановление остановлено.");
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        let st = app.state::<AppState>();
+        let Some(_guard) = st.network_maintenance.try_lock() else { return; };
+        if st.quitting.load(Ordering::SeqCst) || st.tester.is_running() ||
+            !st.cfg().zapret.auto_resolve_conflicts || !st.zapret.current_crash(generation) { return; }
+        let _ = app.emit("zapret://maintenance", "Zapret неожиданно завершился. Восстанавливаем подключение…");
+        let cfg = st.cfg().zapret;
+        match zapret::start(&st.zapret, &st.resources(), &cfg) {
+            Ok(()) => { let _ = app.emit("zapret://maintenance", "Работа Zapret восстановлена."); }
+            Err(error) => {
+                logs::warn("zapret", format!("Автовосстановление завершилось ошибкой: {error}"));
+                let _ = app.emit("zapret://maintenance", "Не удалось восстановить Zapret. Откройте диагностику.");
+            }
+        }
+    });
+}
+
 #[tauri::command]
 async fn zapret_start(app: AppHandle) -> Result<CoreStatus, String> {
     blocking(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
+        if st.quitting.load(Ordering::SeqCst) { return Err("VELIORA завершает работу.".into()); }
         if st.tester.is_running() {
             return Err("Идёт тестирование стратегий — дождитесь окончания.".into());
         }
-        let cfg = st.cfg().zapret;
-        zapret::start(&st.zapret, &st.resources(), &cfg)?;
+        st.zapret_recovery_used.store(false, Ordering::SeqCst);
+        start_zapret(&app)?;
         Ok(st.zapret.status())
     })
     .await
@@ -364,6 +483,7 @@ async fn zapret_start(app: AppHandle) -> Result<CoreStatus, String> {
 async fn zapret_stop(app: AppHandle) -> Result<CoreStatus, String> {
     blocking(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
         if st.tester.is_running() {
             return Err("Идёт тестирование стратегий — дождитесь окончания.".into());
         }
@@ -377,6 +497,8 @@ async fn zapret_stop(app: AppHandle) -> Result<CoreStatus, String> {
 async fn zapret_restart(app: AppHandle) -> Result<CoreStatus, String> {
     blocking(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
+        if st.quitting.load(Ordering::SeqCst) { return Err("VELIORA завершает работу.".into()); }
         if st.tester.is_running() {
             return Err("Идёт тестирование стратегий — дождитесь окончания.".into());
         }
@@ -486,6 +608,8 @@ async fn discord_clear_cache() -> zapret::DiscordCacheResult {
 async fn tester_run(app: AppHandle) -> Result<(), String> {
     blocking(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
+        if st.quitting.load(Ordering::SeqCst) { return Err("VELIORA завершает работу.".into()); }
         tester::run(app.clone(), st.tester.clone(), st.zapret.clone(), st.resources(), st.cfg().zapret)
     })
     .await
@@ -507,27 +631,183 @@ fn tester_reset(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedSaveResult {
+    revision: u64,
+    restarted: bool,
+}
+
+#[tauri::command]
+async fn managed_sites_save(app: AppHandle, revision: u64, sites: Vec<managed_sites::Site>, services: Vec<String>) -> Result<ManagedSaveResult, String> {
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Другая операция Zapret уже выполняется.")?;
+        if st.tester.is_running() || st.quitting.load(Ordering::SeqCst) {
+            return Err("Дождитесь окончания текущей операции Zapret.".into());
+        }
+        let previous = st.cfg();
+        if revision != previous.zapret.managed_revision {
+            return Err("Список изменился. Повторите операцию с актуальным списком.".into());
+        }
+        managed_sites::validate(&sites, &services)?;
+        let mut next = previous.clone();
+        next.zapret.managed_sites = sites;
+        next.zapret.managed_services = services;
+        next.zapret.managed_revision += 1;
+        persist_managed_change(&app, previous, next)
+    }).await
+}
+
+fn persist_managed_change(app: &AppHandle, previous: Config, next: Config) -> Result<ManagedSaveResult, String> {
+    let st = app.state::<AppState>();
+    let running = st.zapret.alive();
+    let changed = next.zapret.strategy.as_ref().is_some_and(|file| {
+        previous.zapret.strategy != next.zapret.strategy ||
+        managed_sites::domains(&previous.zapret.managed_sites, &previous.zapret.managed_services, file)
+            != managed_sites::domains(&next.zapret.managed_sites, &next.zapret.managed_services, file)
+    });
+    if running && changed {
+        let file = next.zapret.strategy.as_ref().ok_or("Нет выбранной стратегии.")?;
+        zapret::build_args(&zapret::active_dir(&st.resources()), file, &next.zapret)?;
+        zapret::stop(&st.zapret);
+        if let Err(error) = zapret::start(&st.zapret, &st.resources(), &next.zapret) {
+            zapret::start(&st.zapret, &st.resources(), &previous.zapret)
+                .map_err(|restore| format!("{error}. Восстановить предыдущий запуск не удалось: {restore}"))?;
+            return Err(format!("{error}. Предыдущая конфигурация восстановлена."));
+        }
+    }
+    let revision = next.zapret.managed_revision;
+    if let Err(error) = apply_config(app, next) {
+        if running && changed {
+            zapret::stop(&st.zapret);
+            zapret::start(&st.zapret, &st.resources(), &previous.zapret)
+                .map_err(|restore| format!("{error}. Восстановить предыдущий запуск не удалось: {restore}"))?;
+        }
+        return Err(error);
+    }
+    Ok(ManagedSaveResult { revision, restarted: running && changed })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedSiteResult {
+    domain: String,
+    profile: Option<&'static str>,
+    state: &'static str,
+}
+
+#[tauri::command]
+fn managed_site_domain(input: String) -> Result<String, String> { managed_sites::single_domain(&input) }
+
+#[tauri::command]
+async fn managed_site_add(app: AppHandle, input: String) -> Result<ManagedSiteResult, String> {
+    let domain = managed_sites::single_domain(&input)?;
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Zapret занят. Повторите чуть позже.")?;
+        if st.tester.is_running() || st.quitting.load(Ordering::SeqCst) {
+            return Err("Дождитесь окончания текущей операции Zapret.".into());
+        }
+        let previous = st.cfg();
+        let mut next = previous.clone();
+        let profile = if let Some(existing) = next.zapret.managed_sites.iter_mut().find(|site| site.domain == domain) {
+            // Reuse a legacy rule and keep its advanced options.
+            existing.enabled = true;
+            None
+        } else if let Some(id) = managed_sites::preset(&domain) {
+            if !next.zapret.managed_services.iter().any(|item| item == id) {
+                next.zapret.managed_services.push(id.into());
+            }
+            Some(id)
+        } else {
+            next.zapret.managed_sites.push(managed_sites::Site {
+                domain: domain.clone(), name: None, enabled: true, strategy: None,
+            });
+            None
+        };
+        managed_sites::validate(&next.zapret.managed_sites, &next.zapret.managed_services)?;
+        let resources = st.resources();
+        let dir = zapret::active_dir(&resources);
+        let configured = next.zapret.strategy.clone();
+        if configured.is_none() && !st.zapret.alive() {
+            if let Some(report) = st.tester.report().filter(|r| !r.cancelled && r.vpn.is_none() &&
+                !r.system_proxy && r.bundle_version == zapret::installed_version(&resources)) {
+                next.zapret.strategy = report.best.into_iter().find(|file| {
+                    report.results.get(file).is_some_and(|r| r.status == "passed") &&
+                        zapret::build_args(&dir, file, &next.zapret).is_ok()
+                });
+            }
+            // A compatible stock profile gives a fresh installation a starting point.
+            // The connection check still has to succeed before showing availability.
+            if next.zapret.strategy.is_none() && zapret::build_args(&dir, "general.bat", &next.zapret).is_ok() {
+                next.zapret.strategy = Some("general.bat".into());
+            }
+        }
+        if let Some(file) = &next.zapret.strategy {
+            zapret::build_args(&dir, file, &next.zapret)
+                .map_err(|_| "Текущие настройки Zapret не подходят для этого сайта. Откройте диагностику Zapret и проверьте доступные варианты.")?;
+        }
+        let strategy = next.zapret.strategy.clone();
+        if next.zapret != previous.zapret {
+            next.zapret.managed_revision += 1;
+            persist_managed_change(&app, previous, next)?;
+        }
+        let cfg = st.cfg();
+        let applies = strategy.as_ref().is_some_and(|file| {
+            managed_sites::domains(&cfg.zapret.managed_sites, &cfg.zapret.managed_services, file).iter()
+                .any(|host| managed_sites::matches_domain(&domain, host))
+        });
+        let state = if !applies { "needs_test" }
+            else if st.zapret.status().state == "running" { "active" }
+            else { "stopped" };
+        Ok(ManagedSiteResult { domain, profile, state })
+    }).await
+}
+
+#[tauri::command]
+async fn managed_site_check(app: AppHandle, input: String) -> Result<bool, String> {
+    let domain = managed_sites::single_domain(&input)?;
+    let st = app.state::<AppState>();
+    let current = st.zapret.status();
+    let cfg = st.cfg().zapret;
+    if st.tester.is_running() || current.state != "running" || !cfg.strategy.as_ref().is_some_and(|file| {
+        managed_sites::domains(&cfg.managed_sites, &cfg.managed_services, file).iter()
+            .any(|host| managed_sites::matches_domain(&domain, host))
+    }) {
+        return Err("Включите обход для этого сайта, затем повторите проверку.".into());
+    }
+    let ok = managed_sites::available(&domain).await;
+    let after = st.zapret.status();
+    let next = st.cfg().zapret;
+    if after.state != "running" || current.pid != after.pid || current.started_at != after.started_at ||
+        cfg.managed_revision != next.managed_revision || cfg.strategy != next.strategy || st.tester.is_running() {
+        return Err("Настройки изменились во время проверки. Повторите её.".into());
+    }
+    Ok(ok)
+}
+
 // ── updates ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn updates_zapret_releases() -> Result<Vec<updates::Release>, String> {
-    blocking(updates::zapret_releases).await
+async fn updates_zapret_releases(app: AppHandle) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let (releases, error) = updates::version_catalog(&app.state::<AppState>().resources());
+        Ok(serde_json::json!({ "releases": releases, "error": error }))
+    }).await
 }
 
 #[tauri::command]
 async fn updates_zapret_install(app: AppHandle, tag: String) -> Result<updates::InstallResult, String> {
     blocking(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
+        if st.quitting.load(Ordering::SeqCst) { return Err("VELIORA завершает работу.".into()); }
         if st.tester.is_running() {
             return Err("Идёт тестирование стратегий — дождитесь окончания.".into());
         }
-        let mut cfg = st.cfg();
+        let cfg = st.cfg();
         let r = updates::install_zapret(&tag, &st.resources(), &st.zapret, &cfg.zapret)?;
-        // Forget a strategy that no longer exists in the new version.
-        if cfg.zapret.strategy.as_ref().is_some_and(|s| !zapret::runtime().join(s).exists()) {
-            cfg.zapret.strategy = None;
-            let _ = apply_config(&app, cfg);
-        }
         st.tester.reset();
         Ok(r)
     })
@@ -590,7 +870,8 @@ async fn diag_run(app: AppHandle) -> diag::DiagReport {
         let res = st.resources();
         let cfg = st.cfg();
         let own_proxy = st.snapshot.lock().is_some();
-        diag::run(&diag::Ctx { resources: &res, tgws: &cfg.tgws, tgws_running: st.tgws.alive(), own_proxy_active: own_proxy })
+        let report = diag::run(&diag::Ctx { resources: &res, tgws: &cfg.tgws, tgws_running: st.tgws.alive(), own_proxy_active: own_proxy, zapret_pid: st.zapret.status().pid });
+        report
     })
     .await
 }
@@ -616,57 +897,85 @@ fn proxy_status() -> Result<proxy::ProxyState, String> {
 #[tauri::command]
 fn proxy_connect(app: AppHandle, state: State<'_, AppState>, kind: String, host: String, port: u16, bypass: String) -> Result<ConnectResult, String> {
     let server = proxy::server_string(&kind, &host, port)?;
-    {
-        let mut snap = state.snapshot.lock();
-        if snap.is_none() {
-            let s = proxy::snapshot()?;
-            persist_snapshot(&app, Some(&s));
-            *snap = Some(s);
-        }
+    let mut snap = state.snapshot.lock();
+    if state.quitting.load(Ordering::SeqCst) {
+        return Err("Приложение завершает работу.".into());
     }
-    proxy::set(&server, &bypass)?;
-    logs::info("proxy", format!("системный прокси включён: {server}"));
+    if snap.is_none() {
+        if snapshot_path(&app)?.try_exists().map_err(|error| error.to_string())? {
+            return Err("Сохранилась точка восстановления системного прокси. Перезапустите VELIORA и проверьте журнал прокси.".into());
+        }
+        let previous = proxy::snapshot()?;
+        persist_snapshot(&app, Some(&previous))?;
+        *snap = Some(previous);
+    }
+    if let Err(error) = proxy::set(&server, &bypass) {
+        return match restore_proxy(&app, &mut snap) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(format!("{error}. Восстановление не удалось: {restore}")),
+        };
+    }
+    logs::info("proxy", "системный прокси включён");
     Ok(ConnectResult { server })
 }
 
 #[tauri::command]
 fn proxy_disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let snap = state.snapshot.lock().take();
+    restore_proxy(&app, &mut state.snapshot.lock())?;
+    Ok(())
+}
+
+fn snapshot_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path().app_data_dir().map(|d| d.join("proxy-snapshot.json"))
+        .map_err(|_| "Не определена папка для сохранения прежних параметров прокси.".into())
+}
+
+fn persist_snapshot(app: &AppHandle, snap: Option<&proxy::Snapshot>) -> Result<(), String> {
+    use std::io::Write;
+    let path = snapshot_path(app)?;
+    let file_error = |error: std::io::Error| format!("Не удалось сохранить точку восстановления прокси: {error}");
     if let Some(snap) = snap {
-        proxy::restore(&snap)?;
-        persist_snapshot(&app, None);
-        logs::info("proxy", "системный прокси выключен, прежние настройки восстановлены");
+        std::fs::create_dir_all(path.parent().ok_or("Не найдена папка восстановления.")?).map_err(file_error)?;
+        let data = serde_json::to_vec(snap).map_err(|error| error.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&tmp).map_err(file_error)?;
+        file.write_all(&data).and_then(|_| file.sync_all()).map_err(file_error)?;
+        drop(file);
+        std::fs::rename(tmp, path).map_err(file_error)
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(file_error(error)),
+        }
+    }
+}
+
+fn restore_proxy(app: &AppHandle, slot: &mut Option<proxy::Snapshot>) -> Result<(), String> {
+    if let Some(snap) = slot.as_ref() {
+        proxy::restore(snap)?;
+        persist_snapshot(app, None)?;
+        *slot = None;
+        logs::info("proxy", "прежние настройки системного прокси восстановлены");
     }
     Ok(())
 }
 
-// Crash safety: the pre-connection snapshot is mirrored to disk, so if the
-// app is killed while connected, the next launch restores the user's settings.
-fn snapshot_path(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_data_dir().ok().map(|d| d.join("proxy-snapshot.json"))
-}
-
-fn persist_snapshot(app: &AppHandle, snap: Option<&proxy::Snapshot>) {
-    let Some(path) = snapshot_path(app) else { return };
-    match snap {
-        Some(s) => {
-            let _ = std::fs::create_dir_all(path.parent().unwrap());
-            let _ = std::fs::write(&path, serde_json::to_vec(s).unwrap_or_default());
-        }
-        None => {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-}
-
 fn recover_after_crash(app: &AppHandle) {
-    let Some(path) = snapshot_path(app) else { return };
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(snap) = serde_json::from_slice::<proxy::Snapshot>(&bytes) {
-            let _ = proxy::restore(&snap);
-            logs::warn("proxy", "после аварийного завершения восстановлены прежние настройки прокси");
+    let result = (|| -> Result<(), String> {
+        let state = app.state::<AppState>();
+        let mut slot = state.snapshot.lock();
+        match std::fs::read(snapshot_path(app)?) {
+            Ok(bytes) => {
+                *slot = Some(serde_json::from_slice(&bytes).map_err(|_| "Точка восстановления прокси повреждена.")?);
+                restore_proxy(app, &mut slot)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
         }
-        let _ = std::fs::remove_file(&path);
+    })();
+    if let Err(error) = result {
+        logs::warn("proxy", format!("Не удалось восстановить прокси после сбоя: {error}"));
     }
 }
 
@@ -702,6 +1011,7 @@ async fn quit_app(app: AppHandle) {
 // ── lifecycle ─────────────────────────────────────────────────────────────
 
 fn shutdown(app: &AppHandle) {
+    if let Some(catalog) = app.try_state::<Arc<catalog::Catalog>>() { catalog.stop(); }
     let st = app.state::<AppState>();
     if st.shut_down.swap(true, Ordering::SeqCst) {
         return;
@@ -710,11 +1020,8 @@ fn shutdown(app: &AppHandle) {
     st.tester.cancel();
     tgws::stop(&st.tgws);
     zapret::stop(&st.zapret);
-    zapret::unload_driver();
-    let snap = st.snapshot.lock().take();
-    if let Some(snap) = snap {
-        let _ = proxy::restore(&snap);
-        persist_snapshot(app, None);
+    if let Err(error) = restore_proxy(app, &mut st.snapshot.lock()) {
+        logs::error("proxy", format!("Ошибка восстановления при выходе: {error}"));
     }
     logs::info("app", "VELIORA App завершает работу");
 }
@@ -752,7 +1059,7 @@ fn state_word(s: &str) -> &'static str {
 /// Updates tray labels, tooltip and icon from the current state.
 pub(crate) fn refresh_tray(app: &AppHandle) {
     let st = app.state::<AppState>();
-    let tg = st.tgws.status();
+    let tg = app.try_state::<Arc<catalog::Catalog>>().map(|c| c.status()).unwrap_or_default();
     let zp = st.zapret.status();
     let proxy = st.proxy_label.lock().clone();
     if let Some(items) = st.tray.lock().as_ref() {
@@ -796,6 +1103,14 @@ fn spawn_toggle(app: &AppHandle, which: &'static str) {
     let app = app.clone();
     std::thread::spawn(move || {
         let st = app.state::<AppState>();
+        let _maintenance = if which == "zapret" {
+            let Some(guard) = st.network_maintenance.try_lock() else {
+                logs::warn("zapret", "Дождитесь завершения текущей операции Zapret.");
+                return;
+            };
+            if st.tester.is_running() || st.quitting.load(Ordering::SeqCst) { return; }
+            Some(guard)
+        } else { None };
         let cfg = st.cfg();
         let r = match which {
             "tgws" if st.tgws.alive() => {
@@ -812,7 +1127,15 @@ fn spawn_toggle(app: &AppHandle, which: &'static str) {
                 let _ = app.emit("nav://go", "zapret");
                 Err("Выберите стратегию Zapret".to_string())
             }
-            _ => zapret::start(&st.zapret, &st.resources(), &cfg.zapret),
+            _ => {
+                st.zapret_recovery_used.store(false, Ordering::SeqCst);
+                let result = start_zapret(&app);
+                if result.is_err() {
+                    show_main(&app);
+                    let _ = app.emit("zapret://conflict-offer", ());
+                }
+                result
+            },
         };
         if let Err(e) = r {
             logs::warn("app", format!("из трея: {e}"));
@@ -837,7 +1160,18 @@ fn build_tray(app: &tauri::App, visible: bool) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => toggle_main(app),
-            "tgws" => spawn_toggle(app, "tgws"),
+            "tgws" => {
+                let app=app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let catalog=app.state::<Arc<catalog::Catalog>>();
+                    let on=catalog.status().state!="running";
+                    if let Err(e)=catalog.power(&app,on,0).await {
+                        logs::warn("app",e);
+                        show_main(&app);
+                        let _=app.emit("nav://go","telegram");
+                    }
+                });
+            }
             "zapret" => spawn_toggle(app, "zapret"),
             "proxy" => {
                 let _ = app.emit("tray://toggle", ());
@@ -865,11 +1199,16 @@ fn autostart_components(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let st = app.state::<AppState>();
+        let _maintenance = st.network_maintenance.lock();
+        if st.quitting.load(Ordering::SeqCst) { return; }
         let res = st.resources();
         if win::is_admin() {
             if let Err(e) = zapret::prepare(&res) {
                 logs::error("zapret", format!("подготовка файлов: {e}"));
             }
+        }
+        if !zapret_conflicts::scan(st.zapret.status().pid, false).is_empty() {
+            logs::info("zapret", "Обнаружен другой сетевой процесс. Состояние будет перепроверено перед запуском Zapret.");
         }
         let cfg = st.cfg();
         if cfg.tgws.auto_start {
@@ -879,7 +1218,7 @@ fn autostart_components(app: &AppHandle) {
         if cfg.zapret.auto_start {
             if cfg.zapret.strategy.is_some() {
                 logs::info("app", "автозапуск Zapret");
-                let _ = zapret::start(&st.zapret, &res, &cfg.zapret);
+                let _ = start_zapret(&app);
             } else {
                 logs::warn("app", "автозапуск Zapret пропущен: стратегия не выбрана");
             }
@@ -897,7 +1236,7 @@ pub fn run() {
 
     // Zapret needs administrator rights: in release builds VELIORA asks for them
     // once at start. If the user declines, it keeps running without Zapret.
-    if !cfg!(debug_assertions) && !win::is_admin() && !args.iter().any(|a| a == "--no-elevate") {
+    if !cfg!(debug_assertions) && win::trusted_install() && !win::is_admin() && !args.iter().any(|a| a == "--no-elevate") {
         let mut pass: Vec<String> = args.iter().filter(|a| !a.starts_with("--wait-parent=")).cloned().collect();
         pass.push("--no-elevate".into());
         match win::relaunch_elevated(&pass) {
@@ -912,6 +1251,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(app_updater::AppUpdater::default())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             app_info,
@@ -925,6 +1266,12 @@ pub fn run() {
             logs_clear,
             logs_export,
             log_ui,
+            catalog::telegram_power,
+            catalog::telegram_power_status,
+            catalog::telegram_show_link,
+            catalog::catalog_view,
+            catalog::catalog_action,
+            catalog::catalog_history,
             core_status,
             tgws_start,
             tgws_stop,
@@ -932,9 +1279,14 @@ pub fn run() {
             tgws_link,
             tgws_regenerate_secret,
             zapret_start,
+            zapret_conflict_scan,
+            zapret_conflict_resolve,
+            zapret_conflict_forget,
             zapret_stop,
             zapret_restart,
             zapret_overview,
+            discord::discord_diagnostics,
+            discord::discord_confirm_media,
             lists_info,
             list_read,
             list_write,
@@ -947,9 +1299,15 @@ pub fn run() {
             tester_cancel,
             tester_state,
             tester_reset,
+            managed_sites_save,
+            managed_site_domain,
+            managed_site_add,
+            managed_site_check,
             updates_zapret_releases,
             updates_zapret_install,
             updates_check,
+            app_updater::app_update_check,
+            app_updater::app_update_install,
             diag_run,
             diag_open,
             proxy_status,
@@ -982,6 +1340,7 @@ pub fn run() {
                 logs::warn("app", "запрос прав администратора отклонён — Zapret недоступен, Telegram-прокси работает");
             }
             recover_after_crash(&handle);
+            if let Some(data)=st.data_dir.get(){app.manage(catalog::Catalog::start(data, &st.resources()));}
             build_tray(app, cfg.app.tray)?;
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_skip_taskbar(cfg.app.tray && cfg.app.hide_taskbar);

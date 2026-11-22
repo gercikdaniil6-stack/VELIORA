@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { useToast } from '../components/Toast';
 import { Banner, Confirm, Spinner } from '../components/ui';
-import { api, pickFile, type ListInfo } from '../lib/api';
+import { api, type ListInfo } from '../lib/api';
 import { useCore } from '../state/core';
 
 const DOMAIN_RE = /^\^?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i;
@@ -94,28 +94,6 @@ export function Lists() {
     }
   };
 
-  const doImport = async () => {
-    try {
-      const path = await pickFile({ title: 'Импорт списка (заменит текущий)' });
-      if (!path) return;
-      const r = await api.listImport(file, path);
-      await loadFile(file);
-      await afterWrite(`Импортировано: ${count(kind, r.saved)}${r.rejected.length ? `, отброшено строк: ${r.rejected.length}` : ''}`);
-    } catch (e) {
-      toast.show({ tone: 'error', title: 'Не удалось импортировать файл', body: (e as Error).message });
-    }
-  };
-  const doExport = async () => {
-    try {
-      const path = await pickFile({ save: true, title: 'Сохранить список', defaultPath: file });
-      if (!path) return;
-      const n = await api.listExport(file, path);
-      toast.show({ tone: 'ok', title: 'Файл сохранён', body: `${count(kind, n)} → ${path}` });
-    } catch (e) {
-      toast.show({ tone: 'error', title: 'Не удалось сохранить файл', body: (e as Error).message });
-    }
-  };
-
   const switchTo = (f: string) => {
     if (f === file) return;
     if (dirty) { setNextFile(f); setConfirm('switch'); } else setFile(f);
@@ -161,8 +139,6 @@ export function Lists() {
               <p className="lead">{info?.desc} <span className="mono muted">{file}</span></p>
             </div>
             <div className="card__actions">
-              <button className="btn btn--icon" title="Импорт: заменить список записями из файла" aria-label="Импорт" onClick={doImport} disabled={locked}><Icon name="upload" size={16} /></button>
-              <button className="btn btn--icon" title="Экспорт: сохранить список в файл" aria-label="Экспорт" onClick={doExport}><Icon name="download" size={16} /></button>
               {info?.hasBackup && <button className="btn btn--icon" title="Вернуть список к состоянию до первой правки" aria-label="Бэкап" onClick={() => setConfirm('backup')} disabled={locked}><Icon name="undo" size={16} /></button>}
             </div>
           </div>

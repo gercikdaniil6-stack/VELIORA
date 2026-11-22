@@ -1,0 +1,126 @@
+.mt-catalog > section,
+.mt-catalog > .banner {
+  margin-bottom: var(--s-4);
+}
+.mt-catalog small,
+.mt-line,
+.mt-history,
+.mt-note,
+.mt-progress,
+.mt-pages {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+.mt-hero.glass {
+  background-image:
+    radial-gradient(ellipse at 95% 8%, color-mix(in srgb, var(--accent-3) 15%, transparent), transparent 52%),
+    var(--glass-fill);
+}
+.mt-heading,
+.mt-current,
+.mt-pages {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.mt-current {
+  padding: 16px 0 4px;
+}
+.mt-current strong,
+.mt-current small {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.mt-heading > div,
+.mt-item > div {
+  min-width: 0;
+}
+.mt-address {
+  display: block;
+  font-size: clamp(18px, 2.4vw, 28px);
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  letter-spacing: -0.035em;
+}
+.mt-emblem {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 50px;
+  height: 50px;
+  border-radius: var(--r-md);
+  color: var(--accent-1);
+  border: 1px solid var(--glass-border-strong);
+}
+.mt-metrics,
+.mt-controls,
+.mt-line,
+.mt-progress {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.mt-metrics {
+  gap: 36px;
+  margin: 20px 0;
+  color: var(--text-2);
+  font-size: var(--fs-12);
+}
+.mt-metrics b {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-1);
+  font-size: var(--fs-16);
+  font-variant-numeric: tabular-nums;
+}
+.mt-progress,
+.mt-note,
+.mt-pages {
+  margin: 14px 0 0;
+}
+.mt-tools {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto;
+  gap: 8px;
+  margin: 18px 0 8px;
+}
+.mt-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 16px 0;
+  border-top: 1px solid var(--glass-border);
+}
+.mt-item strong {
+  overflow-wrap: anywhere;
+}
+.mt-line {
+  margin: 6px 0;
+  gap: 12px;
+}
+.mt-good,
+.mt-star[aria-pressed='true'] {
+  color: var(--ok);
+}
+.mt-star {
+  font-size: 20px;
+}
+.mt-history {
+  padding: 0;
+  list-style: none;
+  max-height: 48vh;
+  overflow: auto;
+}
+.mt-history li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--glass-border);
+}

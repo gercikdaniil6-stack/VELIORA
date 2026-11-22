@@ -1,11 +1,45 @@
+import { useEffect, useRef } from 'react';
+
 /**
  * The space behind the glass: a vertical wash and four soft light sources that
  * drift slowly (GPU transforms only), with a little parallax as pages scroll.
  * Colours and intensity come from the active theme tokens.
  */
 export function Backdrop() {
+  const backdrop = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const element = backdrop.current;
+    if (!element) return;
+    const delay = 8000;
+    let last = 0;
+    let timer = 0;
+    const pause = () => {
+      window.clearTimeout(timer);
+      timer = 0;
+      element.dataset.active = 'false';
+    };
+    const expire = () => {
+      const remaining = delay - (performance.now() - last);
+      if (remaining > 0) timer = window.setTimeout(expire, remaining);
+      else pause();
+    };
+    const activate = () => {
+      if (document.hidden || document.documentElement.dataset.bgAnim !== 'on') return;
+      last = performance.now();
+      if (timer) return;
+      element.dataset.active = 'true';
+      timer = window.setTimeout(expire, delay);
+    };
+    const visibility = () => { if (document.hidden) pause(); };
+    const events = new AbortController();
+    for (const event of ['pointermove', 'pointerdown', 'keydown', 'wheel']) {
+      window.addEventListener(event, activate, { passive: true, signal: events.signal });
+    }
+    document.addEventListener('visibilitychange', visibility, { signal: events.signal });
+    return () => { pause(); events.abort(); };
+  }, []);
   return (
-    <div className="backdrop" aria-hidden="true">
+    <div className="backdrop" ref={backdrop} data-active="false" aria-hidden="true">
       <div className="backdrop__wash" />
       <div className="backdrop__light backdrop__light--1" />
       <div className="backdrop__light backdrop__light--2" />

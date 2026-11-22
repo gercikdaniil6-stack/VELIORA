@@ -2,10 +2,9 @@ import { useEffect, useState } from 'react';
 import { BrandLogo } from '../brand/BrandLogo';
 import { Icon } from '../components/Icon';
 import { LatencyBadge, formatDuration, formatMs, phaseTitle } from '../components/bits';
-import type { Route } from '../components/Sidebar';
 import { useStore } from '../state/store';
 
-export function Overview({ onNavigate }: { onNavigate: (r: Route) => void }) {
+export function Overview({ onNavigate }: { onNavigate: (r: 'servers') => void }) {
   const { data, conn, latency, active, connect, disconnect, probe, setActive } = useStore();
   const [now, setNow] = useState(Date.now());
 

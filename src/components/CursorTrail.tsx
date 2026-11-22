@@ -1,6 +1,7 @@
-import { useMemo } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { computeVars, useActiveTheme } from '../theme/engine';
-import SplashCursor from './SplashCursor/SplashCursor';
+const SplashCursor = lazy(() => import('./SplashCursor/SplashCursor'));
+const IDLE_MS = 25000;
 
 /**
  * The app's single cursor-trail system: React Bits SplashCursor (WebGL2 fluid
@@ -13,6 +14,40 @@ export function CursorTrail() {
   const active = useActiveTheme();
   const appearance = active?.appearance;
   const theme = active?.theme;
+  const enabled = appearance?.cursor.enabled ?? false;
+  const [awake, setAwake] = useState(false);
+  useEffect(() => {
+    if (!enabled) return;
+    let timer = 0;
+    let last = 0;
+    const sleep = () => {
+      clearTimeout(timer);
+      timer = 0;
+      setAwake(false);
+    };
+    const check = () => {
+      const remaining = IDLE_MS - (performance.now() - last);
+      if (remaining > 0) timer = window.setTimeout(check, remaining);
+      else sleep();
+    };
+    const wake = () => {
+      if (document.hidden) return;
+      last = performance.now();
+      if (timer) return;
+      setAwake(true);
+      timer = window.setTimeout(check, IDLE_MS);
+    };
+    const visibility = () => { if (document.hidden) sleep(); };
+    window.addEventListener('pointermove', wake, { passive: true });
+    window.addEventListener('pointerdown', wake, { passive: true });
+    document.addEventListener('visibilitychange', visibility);
+    return () => {
+      sleep();
+      window.removeEventListener('pointermove', wake);
+      window.removeEventListener('pointerdown', wake);
+      document.removeEventListener('visibilitychange', visibility);
+    };
+  }, [enabled]);
 
   // Ink colours follow the active theme (after accent / saturation settings).
   const colors = useMemo(() => {
@@ -22,12 +57,12 @@ export function CursorTrail() {
     return [v['--accent-1'], v['--accent-2'], v['--accent-3']];
   }, [theme, appearance]);
 
-  if (!theme || !appearance || !appearance.cursor.enabled) return null;
+  if (!theme || !appearance || !enabled || !awake) return null;
   const c = appearance.cursor;
   const light = theme.mode === 'light';
   const calm = appearance.reducedMotion || !appearance.uiAnimation;
   return (
-    <SplashCursor
+    <Suspense fallback={null}><SplashCursor
       className="cursor-ink"
       zIndex={0}
       theme={light ? 'light' : 'dark'}
@@ -41,8 +76,8 @@ export function CursorTrail() {
       glow={light ? 0 : c.glow * appearance.glow * 0.5}
       shading={light ? 0.6 : 1}
       clickSplash={c.splash && !calm}
-      quality="medium"
+      quality={calm || theme.id === 'obsidian' ? 'low' : 'medium'}
       intro={false}
-    />
+    /></Suspense>
   );
 }

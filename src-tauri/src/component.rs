@@ -2,7 +2,7 @@
 //! job object, its output streamed into the journal, its exit observed and
 //! reported as a status the UI and tray can show.
 use crate::logs;
-use crate::win::{self, Job};
+use crate::win::Job;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -104,6 +104,23 @@ impl Component {
         msg
     }
 
+    pub fn mark_capture_ready(&self, pid: u32) -> bool {
+        let status = {
+            let mut state = self.inner.lock();
+            if !state.alive || state.stopping || state.health != Health::Ready { return false; }
+            state.status.state = "running";
+            state.status.pid = Some(pid);
+            state.status.clone()
+        };
+        self.emit(&status);
+        true
+    }
+
+    pub fn current_crash(&self, generation: u64) -> bool {
+        let state = self.inner.lock();
+        state.generation == generation && !state.alive && !state.stopping && state.status.state == "error"
+    }
+
     /// Last lines the program printed (for error messages).
     pub fn tail(&self) -> String {
         self.inner.lock().tail.iter().cloned().collect::<Vec<_>>().join("\n")
@@ -111,8 +128,9 @@ impl Component {
 
     /// Spawns `cmd` (already configured) and starts supervising it.
     pub fn spawn(self: &Arc<Self>, mut cmd: Command, hook: LineHook) -> Result<u32, String> {
+        if self.alive() { return Err("Предыдущий процесс ещё работает.".into()); }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let job = Job::new().map(Arc::new);
+        let job = Arc::new(Job::new().ok_or("Windows не создала группу процессов для безопасной остановки.")?);
         let mut child = cmd.spawn().map_err(|e| match e.raw_os_error() {
             Some(2) | Some(3) => "Файл программы не найден — возможно, его удалил антивирус.".to_string(),
             Some(5) => "Windows или антивирус запретил запуск программы.".to_string(),
@@ -120,14 +138,16 @@ impl Component {
             Some(1260) => "Запуск программы заблокирован политикой Windows (Smart App Control или AppLocker).".to_string(),
             _ => format!("Не удалось запустить программу: {e}"),
         })?;
-        if let Some(j) = &job {
-            j.assign(&child);
+        if !job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Windows не позволила отслеживать дочерний процесс. Запуск отменён.".into());
         }
         let pid = child.id();
         let generation = {
             let mut s = self.inner.lock();
             s.generation += 1;
-            s.job = job;
+            s.job = Some(job);
             s.stopping = false;
             s.alive = true;
             s.health = Health::Unknown;
@@ -143,12 +163,18 @@ impl Component {
             std::thread::spawn(move || {
                 let mut r = BufReader::new(stream);
                 let mut buf = Vec::new();
+                let mut discarding = false;
                 loop {
                     buf.clear();
-                    match r.read_until(b'\n', &mut buf) {
+                    match r.by_ref().take(8192).read_until(b'\n', &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
-                            let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                            let chunked = buf.len() == 8192 && buf.last() != Some(&b'\n');
+                            if discarding || chunked {
+                                discarding = chunked;
+                                continue;
+                            }
+                            let line = logs::redact(String::from_utf8_lossy(&buf).trim_end());
                             if line.is_empty() {
                                 continue;
                             }
@@ -176,34 +202,41 @@ impl Component {
         let me = Arc::clone(self);
         std::thread::spawn(move || {
             let code = child.wait().ok().and_then(|s| s.code());
-            let (stale, stopping, tail) = {
+            let (snapshot, message, recover) = {
                 let mut s = me.inner.lock();
-                let stale = s.generation != generation;
-                if !stale {
-                    s.alive = false;
-                    s.job = None;
+                if s.generation != generation {
+                    return;
                 }
-                (stale, s.stopping, s.tail.iter().last().cloned())
-            };
-            if stale {
-                return;
-            }
-            if stopping {
-                logs::info(me.source, "процесс остановлен");
-                me.set_status(|st| {
-                    st.state = "stopped";
-                    st.pid = None;
-                    st.last_error = None;
-                });
-            } else {
-                let mut msg = match code {
-                    Some(c) => format!("Процесс неожиданно завершился (код {c})."),
-                    None => "Процесс неожиданно завершился.".to_string(),
+                let recover = !s.stopping && s.status.state == "running";
+                s.alive = false;
+                s.job = None;
+                s.status.pid = None;
+                let message = if s.stopping {
+                    s.status.state = "stopped";
+                    s.status.last_error = None;
+                    s.status.started_at = None;
+                    None
+                } else {
+                    let mut message = match code {
+                        Some(c) => format!("Процесс неожиданно завершился (код {c})."),
+                        None => "Процесс неожиданно завершился.".into(),
+                    };
+                    if let Some(line) = s.tail.back() {
+                        message.push_str(&format!(" Последнее сообщение: {line}"));
+                    }
+                    s.status.state = "error";
+                    s.status.last_error = Some(message.clone());
+                    Some(message)
                 };
-                if let Some(t) = tail {
-                    msg.push_str(&format!(" Последнее сообщение: {t}"));
-                }
-                me.fail(msg);
+                (s.status.clone(), message, recover)
+            };
+            match message {
+                Some(message) => logs::error(me.source, message),
+                None => logs::info(me.source, "процесс остановлен"),
+            }
+            me.emit(&snapshot);
+            if recover && me.source == "zapret" {
+                if let Some(app) = me.app.get() { crate::recover_zapret(app, generation); }
             }
         });
         Ok(pid)
@@ -224,14 +257,7 @@ impl Component {
             s.stopping = true;
             s.job.clone()
         };
-        let Some(job) = job else {
-            let mut s = self.inner.lock();
-            if let Some(pid) = s.status.pid.filter(|_| s.alive) {
-                win::kill_pid(pid);
-            }
-            s.alive = false;
-            return;
-        };
+        let Some(job) = job else { return; };
         job.terminate();
         let deadline = Instant::now() + Duration::from_millis(2500);
         while self.alive() && Instant::now() < deadline {
@@ -243,7 +269,7 @@ impl Component {
     pub fn mark_stopped(&self) {
         {
             let mut s = self.inner.lock();
-            s.alive = false;
+            if s.alive { return; }
             s.job = None;
         }
         self.set_status(|st| {

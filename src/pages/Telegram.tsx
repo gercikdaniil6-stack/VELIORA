@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { useToast } from '../components/Toast';
-import { Banner, Field, ServiceCard, Spinner } from '../components/ui';
+import { Banner, Field, Seg, ServiceCard, Spinner } from '../components/ui';
 import { Setting } from '../components/bits';
 import { api, copyText } from '../lib/api';
 import { useCore } from '../state/core';
@@ -9,7 +9,20 @@ import { useCore } from '../state/core';
 const HOST_RE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*)$/i;
 const DOMAIN_RE = /^(?!\d+\.\d+\.\d+\.\d+$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i;
 
+import { TelegramProxy } from './TelegramProxy';
+
+const modes = [{ value: 'catalog', label: 'Серверы' }, { value: 'local', label: 'Локальный режим' }];
+
 export function Telegram() {
+  const [mode, setMode] = useState('catalog');
+  return <div className="page">
+    <header className="page-head"><div><h1>Telegram</h1><p>Подключение через прокси и выбор сервера.</p></div></header>
+    <div style={{ marginBottom: 'var(--s-5)' }}><Seg label="Режим Telegram" value={mode} options={modes} onChange={setMode} /></div>
+    {mode === 'catalog' ? <TelegramProxy /> : <LocalProxy />}
+  </div>;
+}
+
+function LocalProxy() {
   const core = useCore();
   const toast = useToast();
   const t = core.config.tgws;
@@ -61,16 +74,9 @@ export function Telegram() {
   const masked = link.replace(/secret=dd([0-9a-f]{4})[0-9a-f]+/i, 'secret=dd$1••••••••••••••••••••••••••••');
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div>
-          <h1>Telegram</h1>
-          <p>Локальный MTProto-прокси: Telegram подключается к нему, а он передаёт трафик через WebSocket на веб-узлы Telegram, с запасным каналом через Cloudflare.</p>
-        </div>
-      </div>
-
+    <>
       <div className="stack">
-        <ServiceCard icon="telegram" title="Telegram-прокси" subtitle={<span className="mono">{t.host}:{t.port}</span>} status={st} pending={core.pending.tgws}
+        <ServiceCard icon="telegram" title="Локальный прокси" subtitle={<span className="mono">{t.host}:{t.port}</span>} status={st} pending={core.pending.tgws}
           version={core.info?.tgwsVersion} onToggle={(on) => core.toggle('tgws', on)}>
           <span className="service__note">{st.state === 'running' ? 'Telegram может подключаться' : 'Нажмите переключатель, чтобы запустить'}</span>
         </ServiceCard>
@@ -102,7 +108,7 @@ export function Telegram() {
             </Field>
           </div>
           <div className="stack" style={{ gap: 16, marginTop: 16 }}>
-            <Field label="Секретный ключ (32 hex, MTProto)" error={errors.secret}>
+            <Field label="Секретный ключ (32 hex)" error={errors.secret}>
               <div className="input-row">
                 <input className="input mono" type={showSecret ? 'text' : 'password'} value={form.secret} aria-invalid={!!errors.secret}
                   onChange={(e) => setForm({ ...form, secret: e.target.value.trim() })} spellCheck={false} autoComplete="off" />
@@ -129,6 +135,6 @@ export function Telegram() {
             onChange={(v) => core.save((c) => ({ ...c, tgws: { ...c.tgws, verbose: v } }), { quiet: true })} />
         </section>
       </div>
-    </div>
+    </>
   );
 }

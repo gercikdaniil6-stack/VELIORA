@@ -7,7 +7,7 @@
 - **Файл:** `src-tauri/components/tgws/TgWsProxy.exe`, SHA-256 записан в `components.json`.
 - **Запуск:** `TgWsProxy.exe --host 127.0.0.1 --port 1443 --secret <32 hex> [--cfproxy-worker-domain <домен>] [-v]`, скрыто, внутри job object (процесс и его потомки завершаются вместе с VELIORA, даже при аварии).
 - **Ссылка:** `tg://proxy?server=<хост>&port=<порт>&secret=dd<ключ>` — режим со случайным выравниванием пакетов, его выводит и сам прокси.
-- **Проверено:** реальный обмен MTProto (`req_pq_multi` → `resPQ`) через прокси, запущенный кнопкой в приложении: DC2 и DC4 напрямую по WebSocket (~55 мс), DC5 через Cloudflare (~1 с); неверный ключ отклоняется.
+- **Проверено:** реальный обмен с Telegram (`req_pq_multi` → `resPQ`) через прокси, запущенный кнопкой в приложении: DC2 и DC4 напрямую по WebSocket (~55 мс), DC5 через Cloudflare (~1 с); неверный ключ отклоняется.
 
 ## Zapret (сборка Flowseal 1.10.4)
 

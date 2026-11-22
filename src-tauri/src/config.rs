@@ -23,12 +23,31 @@ impl Default for TgwsConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscordUdp {
+    #[default]
+    Bundle,
+    Discovery,
+    Direct,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordVerified {
+    pub strategy: String,
+    pub udp: DiscordUdp,
+    pub version: String,
+    pub at: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ZapretConfig {
     /// File name of the selected strategy (general (ALT).bat …)
     pub strategy: Option<String>,
     pub auto_start: bool,
+    pub auto_resolve_conflicts: bool,
     /// off | all | tcp | udp
     pub game_filter: String,
     pub game_tcp: String,
@@ -39,6 +58,11 @@ pub struct ZapretConfig {
     pub fake_discord: Option<String>,
     /// Replacement for ACTIVE_GAME_UDP.bin
     pub fake_game: Option<String>,
+    pub discord_udp: DiscordUdp,
+    pub discord_verified: Option<DiscordVerified>,
+    pub managed_sites: Vec<crate::managed_sites::Site>,
+    pub managed_services: Vec<String>,
+    pub managed_revision: u64,
 }
 
 impl Default for ZapretConfig {
@@ -46,12 +70,18 @@ impl Default for ZapretConfig {
         Self {
             strategy: None,
             auto_start: false,
+            auto_resolve_conflicts: true,
             game_filter: "off".into(),
             game_tcp: "1024-65535".into(),
             game_udp: "1024-65535".into(),
             ipset_mode: "basic".into(),
             fake_discord: None,
             fake_game: None,
+            discord_udp: DiscordUdp::Bundle,
+            discord_verified: None,
+            managed_sites: Vec::new(),
+            managed_services: Vec::new(),
+            managed_revision: 0,
         }
     }
 }
@@ -66,6 +96,7 @@ pub struct AppPrefs {
     pub close_to_tray: bool,
     pub hide_taskbar: bool,
     pub auto_check_updates: bool,
+    pub app_auto_check_updates: bool,
     pub show_splash: bool,
     pub reduce_transparency: bool,
 }
@@ -79,6 +110,7 @@ impl Default for AppPrefs {
             close_to_tray: true,
             hide_taskbar: false,
             auto_check_updates: true,
+            app_auto_check_updates: true,
             show_splash: true,
             reduce_transparency: false,
         }
@@ -144,6 +176,7 @@ impl Config {
             return Err(format!("Не похоже на домен: {}. Укажите адрес без https:// и без пути.", t.worker_domain));
         }
         let z = &self.zapret;
+        crate::managed_sites::validate(&z.managed_sites, &z.managed_services)?;
         if !["off", "all", "tcp", "udp"].contains(&z.game_filter.as_str()) {
             return Err("Неизвестный режим игрового фильтра.".into());
         }
@@ -168,35 +201,91 @@ impl Store {
     }
 
     pub fn load(&self) -> Config {
-        for p in [self.path.clone(), self.path.with_extension("json.backup")] {
-            if let Ok(bytes) = std::fs::read(&p) {
-                if let Ok(mut c) = serde_json::from_slice::<Config>(&bytes) {
-                    if !valid_secret(&c.tgws.secret) {
-                        c.tgws.secret = crate::win::random_hex(16);
-                    }
-                    return c;
+        let backup = self.path.with_extension("json.backup");
+        for path in [&self.path, &backup] {
+            if let Ok((config, legacy)) = Self::read(path) {
+                if path == &backup {
+                    crate::logs::warn("app", "Настройки загружены из резервной копии.");
                 }
+                if legacy {
+                    if let Err(error) = self.save(&config) {
+                        crate::logs::warn("app", format!("Не удалось защитить локальный ключ: {error}"));
+                    }
+                }
+                return config;
             }
         }
-        let c = Config::default();
-        let _ = self.save(&c);
-        c
+        let config = Config::default();
+        if matches!(self.path.try_exists(), Ok(false)) && matches!(backup.try_exists(), Ok(false)) {
+            if let Err(error) = self.save(&config) {
+                crate::logs::warn("app", error);
+            }
+        } else {
+            crate::logs::warn("app", "Файлы настроек не читаются. Использованы значения по умолчанию на этот запуск.");
+        }
+        config
     }
 
-    pub fn save(&self, c: &Config) -> Result<(), String> {
-        let data = serde_json::to_vec_pretty(c).map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &data).map_err(|e| format!("Не удалось записать настройки: {e}"))?;
-        if self.path.exists() {
-            let _ = std::fs::copy(&self.path, self.path.with_extension("json.backup"));
+    fn read(path: &Path) -> Result<(Config, bool), String> {
+        let mut config: Config = serde_json::from_reader(std::io::BufReader::new(
+            std::fs::File::open(path).map_err(|error| error.to_string())?,
+        )).map_err(|_| "Не удалось прочитать файл настроек.")?;
+        let legacy = match config.tgws.secret.strip_prefix("dpapi:") {
+            Some(value) => {
+                let bytes = hex::decode(value).map_err(|_| "Защищённый ключ повреждён.")?;
+                config.tgws.secret = String::from_utf8(crate::catalog::vault::transform(&bytes, false)?)
+                    .map_err(|_| "Защищённый ключ повреждён.")?;
+                false
+            }
+            None => true,
+        };
+        config.validate()?;
+        Ok((config, legacy))
+    }
+
+    fn write(path: &Path, config: &Config) -> Result<(), String> {
+        use std::io::Write;
+        let mut protected = config.clone();
+        let key = crate::catalog::vault::transform(config.tgws.secret.as_bytes(), true)?;
+        protected.tgws.secret = format!("dpapi:{}", hex::encode(key));
+        let data = serde_json::to_vec_pretty(&protected).map_err(|error| error.to_string())?;
+        let tmp = path.with_extension("tmp");
+        let file_error = |error: std::io::Error| format!("Не удалось сохранить настройки: {error}");
+        let mut file = std::fs::File::create(&tmp).map_err(file_error)?;
+        file.write_all(&data).and_then(|_| file.sync_all()).map_err(file_error)?;
+        drop(file);
+        std::fs::rename(tmp, path).map_err(file_error)
+    }
+
+    pub fn save(&self, config: &Config) -> Result<(), String> {
+        let backup = self.path.with_extension("json.backup");
+        if let Ok((previous, _)) = Self::read(&self.path).or_else(|_| Self::read(&backup)) {
+            Self::write(&backup, &previous)?;
         }
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("Файл настроек занят: {e}"))
+        Self::write(&self.path, config)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encrypted_backup_recovers_legacy_settings() {
+        let dir = std::env::temp_dir().join(format!("veliora-config-{}", crate::win::random_hex(8)));
+        let store = Store::new(&dir);
+        let config = Config::default();
+        std::fs::write(&store.path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(store.load(), config);
+        for path in [&store.path, &store.path.with_extension("json.backup")] {
+            let contents = std::fs::read_to_string(path).unwrap();
+            assert!(contents.contains("dpapi:"));
+            assert!(!contents.contains(&config.tgws.secret));
+        }
+        std::fs::write(&store.path, "corrupt").unwrap();
+        assert_eq!(store.load(), config);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn validators() {
         assert!(valid_ports("1024-65535"));

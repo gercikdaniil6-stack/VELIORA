@@ -1,10 +1,10 @@
 [package]
 name = "veliora-app"
-version = "2.1.0"
+version = "2.2.10"
 description = "VELIORA App — Telegram proxy, Zapret DPI bypass and system proxy manager"
 authors = ["VELIORA"]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 
 [lib]
 name = "veliora_lib"
@@ -14,17 +14,26 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22"
+hex = "0.4"
+libloading = "0.8"
+rusqlite = { version = "0.43", features = ["bundled"] }
+scraper = "0.24"
+url = "2"
+ip_network = "0.4"
+httpdate = "1"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "http2", "charset"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+tokio = { version = "1", features = ["sync", "net", "time", "io-util", "macros", "rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "http2", "charset", "system-proxy"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 getrandom = "0.2"
+tauri-plugin-updater = "2.14.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
@@ -35,13 +44,17 @@ windows-sys = { version = "0.61", features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_Security_WinTrust",
   "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_JobObjects",
   "Win32_System_Services",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Shell",
+  "Win32_System_Com",
 ] }
 
 [profile.release]

@@ -27,3 +27,10 @@ no Slipgate source code, text or artwork is included.
 
 The cursor trail (`src/components/SplashCursor/`) is based on the SplashCursor
 component from React Bits (https://reactbits.dev, MIT + Commons Clause).
+
+The Telegram Proxy catalog loads TDLib 1.8.70 (Boost Software License 1.0),
+built from tdlib/td commit c8828d50f5eac2fc7089ce1089d7ce9095c61b5e.
+The Windows x64 binary is distributed by the tdl project in
+@prebuilt-tdlib/win32-x64 0.1008070.0 (package license 0BSD).
+The installer includes both license texts under tdlib/.
+Sources: https://github.com/tdlib/td and https://github.com/eilvelia/tdl .

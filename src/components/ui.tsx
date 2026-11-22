@@ -106,7 +106,7 @@ export function Seg<T extends string>({ value, options, onChange, disabled, labe
 
 /** Dropdown with an animated glass menu; keyboard: arrows, Enter, Esc. */
 export function SelectBox({ value, onChange, options, disabled, label }: {
-  value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; disabled?: boolean; label: string;
+  value: string; onChange: (v: string) => void; options: { value: string; label: string; detail?: string; fresh?: boolean }[]; disabled?: boolean; label: string;
 }) {
   const [open, setOpen] = useState(false);
   const [hi, setHi] = useState(0);
@@ -128,13 +128,14 @@ export function SelectBox({ value, onChange, options, disabled, label }: {
     if (e.key === 'Escape') { e.preventDefault(); setOpen(false); }
     if (e.key === 'ArrowDown') { e.preventDefault(); setHi((h) => Math.min(options.length - 1, h + 1)); }
     if (e.key === 'ArrowUp') { e.preventDefault(); setHi((h) => Math.max(0, h - 1)); }
-    if (e.key === 'Enter') { e.preventDefault(); pick(options[hi].value); }
+    if (e.key === 'Enter' && options[hi]) { e.preventDefault(); pick(options[hi].value); }
   };
   return (
     <div className={`select${open ? ' is-open' : ''}`} ref={wrap}>
       <button type="button" className="select__button" aria-haspopup="listbox" aria-expanded={open} aria-label={label} disabled={disabled}
         onClick={() => setOpen(!open)} onKeyDown={key}>
         <span className="select__value">{current?.label}</span>
+        {current?.fresh && <span className="manager-new">NEW</span>}
         <Icon name="chevronDown" size={16} />
       </button>
       {mounted && (
@@ -142,7 +143,8 @@ export function SelectBox({ value, onChange, options, disabled, label }: {
           {options.map((o, i) => (
             <div key={o.value} role="option" aria-selected={o.value === value} className={`select__option${i === hi ? ' is-hi' : ''}`}
               onMouseEnter={() => setHi(i)} onMouseDown={(e) => { e.preventDefault(); pick(o.value); }}>
-              <span>{o.label}</span>
+              <span>{o.label}{o.detail && <small className="manager-version-detail">{o.detail}</small>}</span>
+              {o.fresh && <span className="manager-new">NEW</span>}
               {o.value === value && <Icon name="check" size={14} />}
             </div>
           ))}

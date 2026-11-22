@@ -14,6 +14,28 @@ export interface CoreStatus {
 }
 
 export interface TgwsConfig { host: string; port: number; secret: string; workerDomain: string; autoStart: boolean; verbose: boolean }
+export type DiscordUdp = 'bundle' | 'discovery' | 'direct';
+export interface DiscordVerified { strategy: string; udp: DiscordUdp; version: string; at: number }
+export interface DiscordDiagnostics {
+  web: Probe[];
+  udp: { sent: number; received: number; averageMs: number | null; error: string | null };
+  status: CoreStatus;
+  captureConfirmed: boolean;
+  competing: number;
+  mtu: number[];
+  vpn: boolean;
+}
+export interface ManagedSite { name?: string | null; domain: string; enabled: boolean; strategy: string | null }
+export interface ZapretConflict {
+  label: string;
+  image: string;
+  path?: string | null;
+  pid: number;
+  confirmed: boolean;
+  signatureVerified?: boolean | null;
+  token?: string | null;
+}
+
 export interface ZapretConfig {
   strategy: string | null;
   autoStart: boolean;
@@ -23,6 +45,12 @@ export interface ZapretConfig {
   ipsetMode: 'basic' | 'full' | 'any';
   fakeDiscord: string | null;
   fakeGame: string | null;
+  autoResolveConflicts?: boolean;
+  discordUdp?: DiscordUdp;
+  discordVerified?: DiscordVerified | null;
+  managedSites?: ManagedSite[];
+  managedServices?: string[];
+  managedRevision?: number;
 }
 export interface AppPrefs {
   launchAtLogin: boolean;
@@ -31,6 +59,7 @@ export interface AppPrefs {
   closeToTray: boolean;
   hideTaskbar: boolean;
   autoCheckUpdates: boolean;
+  appAutoCheckUpdates: boolean;
   showSplash: boolean;
   reduceTransparency: boolean;
 }
@@ -89,7 +118,7 @@ export interface TestReport {
 }
 export interface TestProgress { phase: 'baseline' | 'testing' | 'recheck' | 'done' | 'cancelled' | 'error'; current: number; total: number; strategy?: string | null; message?: string | null }
 
-export interface Release { tag: string; name: string; publishedAt: string; notes: string; assetName?: string | null; assetUrl?: string | null; size: number; sha256?: string | null }
+export interface Release { tag: string; name: string; publishedAt: string; notes: string; assetName?: string | null; assetUrl?: string | null; size: number; sha256?: string | null; installed: boolean; latest: boolean }
 export interface UpdateCheck {
   zapretInstalled: string; zapretLatest?: string | null; zapretUpdate: boolean;
   tgwsInstalled: string; tgwsLatest?: string | null; tgwsUpdate: boolean;
@@ -125,7 +154,7 @@ const STOPPED: CoreStatus = { state: 'stopped' };
 export const DEFAULT_CONFIG: Config = {
   tgws: { host: '127.0.0.1', port: 1443, secret: '0123456789abcdef0123456789abcdef', workerDomain: '', autoStart: false, verbose: false },
   zapret: { strategy: null, autoStart: false, gameFilter: 'off', gameTcp: '1024-65535', gameUdp: '1024-65535', ipsetMode: 'basic', fakeDiscord: null, fakeGame: null },
-  app: { launchAtLogin: false, silentStart: false, tray: true, closeToTray: true, hideTaskbar: false, autoCheckUpdates: true, showSplash: true, reduceTransparency: false },
+  app: { launchAtLogin: false, silentStart: false, tray: true, closeToTray: true, hideTaskbar: false, autoCheckUpdates: true, appAutoCheckUpdates: true, showSplash: true, reduceTransparency: false },
 };
 
 export const api = {
@@ -147,6 +176,9 @@ export const api = {
   logUi: (level: 'info' | 'warn' | 'error', text: string) => (isTauri ? call<void>('log_ui', { level, text }) : Promise.resolve()),
 
   coreStatus: () => call<{ tgws: CoreStatus; zapret: CoreStatus }>('core_status', undefined, { tgws: STOPPED, zapret: STOPPED }),
+  telegramPowerStatus: () => call<CoreStatus>('telegram_power_status', undefined, STOPPED),
+  telegramPower: (on: boolean, id = 0) => call<void>('telegram_power', { on, id }),
+  telegramShowLink: () => call<void>('telegram_show_link'),
   tgwsStart: () => call<CoreStatus>('tgws_start'),
   tgwsStop: () => call<CoreStatus>('tgws_stop'),
   tgwsRestart: () => call<CoreStatus>('tgws_restart'),
@@ -154,6 +186,9 @@ export const api = {
   tgwsRegenerate: () => call<string>('tgws_regenerate_secret'),
 
   zapretStart: () => call<CoreStatus>('zapret_start'),
+  zapretConflicts: () => call<{ conflicts: ZapretConflict[] }>('zapret_conflict_scan', undefined, { conflicts: [] }),
+  resolveZapretConflict: (token: string, remember: boolean) => call<CoreStatus>('zapret_conflict_resolve', { token, remember }),
+  forgetZapretPermissions: () => call<void>('zapret_conflict_forget'),
   zapretStop: () => call<CoreStatus>('zapret_stop'),
   zapretRestart: () => call<CoreStatus>('zapret_restart'),
   zapretOverview: () => call<ZapretOverview>('zapret_overview', undefined, { strategies: [], fakes: [], ipsetFull: 0, version: '1.10.4', source: 'bundled', ready: false, admin: false }),
@@ -165,6 +200,8 @@ export const api = {
   listExport: (file: string, path: string) => call<number>('list_export', { file, path }),
   listRestoreBackup: (file: string) => call<void>('list_restore_backup', { file }),
   listsFactoryReset: () => call<number>('lists_factory_reset'),
+  discordDiagnostics: () => call<DiscordDiagnostics>('discord_diagnostics'),
+  discordConfirmMedia: (startedAt: number) => call<DiscordVerified>('discord_confirm_media', { startedAt }),
   discordClearCache: () => call<{ installed: boolean; closed: string[]; removed: number; failed: string[] }>('discord_clear_cache'),
 
   testerRun: () => call<void>('tester_run'),
@@ -172,7 +209,11 @@ export const api = {
   testerState: () => call<{ running: boolean; report: TestReport | null }>('tester_state', undefined, { running: false, report: null }),
   testerReset: () => call<void>('tester_reset'),
 
-  releases: () => call<Release[]>('updates_zapret_releases'),
+  releases: () => call<{releases: Release[]; error: string | null}>('updates_zapret_releases', undefined, { releases: [], error: null }),
+  siteDomain: (input: string) => call<string>('managed_site_domain', { input }),
+  addSite: (input: string) => call<{ domain: string; profile: string | null; state: 'active' | 'stopped' | 'needs_test' }>('managed_site_add', { input }),
+  checkSite: (input: string) => call<boolean>('managed_site_check', { input }),
+  saveSites: (revision: number, sites: ManagedSite[], services: string[]) => call<{ revision: number; restarted: boolean }>('managed_sites_save', { revision, sites, services }),
   installZapret: (tag: string) => call<{ version: string; strategies: number }>('updates_zapret_install', { tag }),
   checkUpdates: () => call<UpdateCheck>('updates_check'),
 

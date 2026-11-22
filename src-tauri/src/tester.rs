@@ -149,7 +149,7 @@ fn classify_error(e: &reqwest::Error) -> &'static str {
 
 /// One HTTPS request on a fresh connection (no pooling, no system proxy):
 /// any HTTP answer means the TLS handshake got through.
-fn probe_one(service: &str, url: &str) -> Probe {
+pub(crate) fn probe_one(service: &str, url: &str) -> Probe {
     let t0 = Instant::now();
     let r = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -277,7 +277,7 @@ pub fn run(app: AppHandle, tester: Arc<Tester>, zap: Arc<Component>, resources: 
         return Err(e);
     }
     let dir = zapret::runtime();
-    if let Err(e) = zapret::preflight(&dir).or_else(|e| if zap.alive() { Ok(()) } else { Err(e) }) {
+    if let Err(e) = zapret::preflight(zap.status().pid) {
         finish(&tester);
         return Err(e);
     }

@@ -36,6 +36,9 @@ fn xml(exe: &str) -> String {
 }
 
 pub fn enable() -> Result<(), String> {
+    if !win::trusted_install() {
+        return Err("Для автозапуска установите VELIORA в Program Files.".into());
+    }
     if !win::is_admin() {
         return Err("Для запуска вместе с Windows нужны права администратора.".into());
     }

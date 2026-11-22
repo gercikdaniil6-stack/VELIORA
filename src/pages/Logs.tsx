@@ -2,8 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { useToast } from '../components/Toast';
 import { Seg } from '../components/ui';
-import { api, pickFile, type LogEntry } from '../lib/api';
-import { useCore } from '../state/core';
+import { api, listen, pickFile, type LogEntry } from '../lib/api';
 
 const SOURCES: { id: 'all' | LogEntry['source']; label: string }[] = [
   { id: 'all', label: 'Все' },
@@ -18,7 +17,27 @@ const SRC_LABEL: Record<string, string> = { tgws: 'Telegram', zapret: 'Zapret', 
 const time = (ms: number) => new Date(ms).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
 export function Logs() {
-  const { logs, setLogs } = useCore();
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  useEffect(() => {
+    let live = true;
+    let loading = true;
+    const queued: LogEntry[] = [];
+    const off = listen<LogEntry>('log://entry', (entry) => {
+      if (!live) return;
+      if (loading) {
+        if (queued.length === 3000) queued.shift();
+        queued.push(entry);
+      } else setLogs((previous) => [...previous.slice(-2999), entry]);
+    });
+    void off.then(() => live ? api.logsHistory() : []).catch(() => []).then((history) => {
+      if (!live) return;
+      const unique = new Map([...history, ...queued].map((entry) => [entry.id, entry]));
+      loading = false;
+      queued.length = 0;
+      setLogs([...unique.values()].sort((a, b) => a.id - b.id).slice(-3000));
+    });
+    return () => { live = false; void off.then((remove) => remove()).catch(() => {}); };
+  }, []);
   const toast = useToast();
   const [src, setSrc] = useState<(typeof SOURCES)[number]['id']>('all');
   const [problems, setProblems] = useState(false);

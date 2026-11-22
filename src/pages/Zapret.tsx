@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { DiscordDiagnostics } from '../components/DiscordDiagnostics';
 import { Icon } from '../components/Icon';
 import { useToast } from '../components/Toast';
 import { Banner, Confirm, Field, Help, Seg, SelectBox, ServiceCard, Skeleton, Spinner } from '../components/ui';
-import { api, type Release, type Strategy, type StrategyResult, type ZapretConfig, type ZapretOverview } from '../lib/api';
+import { api, type Strategy, type StrategyResult, type ZapretConfig, type ZapretOverview } from '../lib/api';
 import { useCore } from '../state/core';
 
 const PORTS_RE = /^\s*\d{1,5}(\s*-\s*\d{1,5})?(\s*,\s*\d{1,5}(\s*-\s*\d{1,5})?)*\s*$/;
@@ -35,8 +36,7 @@ export function Zapret() {
   const [ov, setOv] = useState<ZapretOverview | null>(null);
   const [ports, setPorts] = useState({ tcp: z.gameTcp, udp: z.gameUdp });
   const [confirmReset, setConfirmReset] = useState<null | 'test' | 'bypass' | 'discord'>(null);
-  const [releases, setReleases] = useState<Release[] | null>(null);
-  const [relError, setRelError] = useState<string | null>(null);
+  const { releases, error: relError, loading: versionsLoading } = core.versions;
   const [pick, setPick] = useState('');
   const [installing, setInstalling] = useState(false);
 
@@ -83,28 +83,23 @@ export function Zapret() {
   const prog = tester.progress;
   const pct = prog && prog.total ? Math.round((prog.phase === 'baseline' ? 0 : prog.current / prog.total) * 100) : 0;
 
-  const loadReleases = async () => {
-    setRelError(null);
-    try {
-      const r = await api.releases();
-      setReleases(r);
-      setPick(r[0]?.tag ?? '');
-    } catch (e) {
-      setRelError((e as Error).message);
-    }
-  };
+  const activeVersion = ov?.version ?? core.info?.zapretInstalled;
+  const selected = releases.find((r) => r.tag === (pick || activeVersion)) ?? releases[0];
+  const installable = !!selected && selected.tag !== activeVersion && (selected.installed || !!selected.sha256);
   const install = async () => {
-    if (!pick) return;
+    if (!selected || !installable) return;
+    const tag = selected.tag;
     setInstalling(true);
-    const id = toast.show({ tone: 'busy', title: `Устанавливаю Zapret ${pick}…`, body: 'Скачиваю архив, проверяю SHA-256 и переношу ваши списки.' });
+    const id = toast.show({ tone: 'busy', title: `Устанавливаю Zapret ${tag}…`, body: 'Скачиваю архив, проверяю SHA-256 и переношу ваши списки.' });
     try {
-      const r = await api.installZapret(pick);
+      const r = await api.installZapret(tag);
       toast.update(id, { tone: 'ok', title: `Установлена сборка ${r.version}`, body: `Стратегий: ${r.strategies}. Результаты прошлого теста сброшены — протестируйте заново.` });
       await core.refreshInfo();
       await core.refreshTester();
-      load();
+      await load();
+      void core.refreshVersions();
     } catch (e) {
-      toast.update(id, { tone: 'error', title: 'Не удалось установить версию', body: (e as Error).message });
+      toast.update(id, { tone: 'error', title: 'Не удалось сменить версию', body: (e as Error).message });
     } finally {
       setInstalling(false);
     }
@@ -151,11 +146,36 @@ export function Zapret() {
           {!z.strategy && <span className="service__note">Нужна стратегия</span>}
         </ServiceCard>
 
+        <section className="glass card manager-version-card">
+          <h2>Версия сборки</h2>
+          <p className="lead">Установлена <b>{ov?.version ?? '…'}</b>{ov?.source === 'update' ? ' (обновлена из приложения)' : ' (встроенная)'}. Источник — официальные релизы Flowseal/zapret-discord-youtube, установка только с проверкой SHA-256.</p>
+          <div className="manager-controls manager-version">
+            {releases.length > 0 && <SelectBox label="Версия Zapret" value={selected?.tag ?? ''} onChange={setPick} disabled={installing}
+              options={releases.map((r) => ({
+                value: r.tag,
+                label: r.tag + (r.tag === activeVersion ? ' · активная' : r.installed ? ' · доступна локально' : ''),
+                detail: (r.publishedAt ? new Date(r.publishedAt).toLocaleDateString('ru-RU', { year: 'numeric', month: 'short', day: 'numeric' }) : '')
+                  + (!r.sha256 && !r.installed ? ' · SHA-256 отсутствует' : ''),
+                fresh: r.latest && r.tag !== activeVersion,
+              }))} />}
+            <button className="btn" onClick={() => void core.refreshVersions()} disabled={versionsLoading || installing}>
+              {versionsLoading ? <Spinner size={16} /> : <Icon name="refresh" size={16} />} Обновить список
+            </button>
+            {releases.length > 0 && <button className="btn btn--primary" disabled={installing || !admin || tester.running || !installable} onClick={() => void install()}>
+              {installing ? <Spinner size={14} /> : <Icon name="download" size={16} />} {selected?.installed ? 'Переключить' : 'Установить'}
+            </button>}
+          </div>
+          {relError && <p className="field__error" role="status">{relError}</p>}
+          {selected && <p className="field__hint">При смене версии VELIORA проверяет совместимость выбранной стратегии и переносит пользовательские списки.</p>}
+        </section>
+
+        <DiscordDiagnostics />
+
         <section className="glass card">
           <div className="card__head">
             <div>
-              <h2>Стратегии {report && !tester.running && <span className="card__count">{passed} из {Object.keys(report.results).length} работают</span>}</h2>
-              <p className="lead">Тест сравнивает доступность сервисов без обхода и с каждой стратегией, учитывает скорость и то, что стратегия ломает, и перепроверяет лучших.</p>
+              <h2>Стратегии {report && !tester.running && <span className="card__count">{passed} из {Object.keys(report.results).length} прошли HTTPS-проверку</span>}</h2>
+              <p className="lead">HTTPS-тест сравнивает доступность сервисов без обхода и с каждой стратегией, учитывает скорость и то, что стратегия ломает, и перепроверяет лучших.</p>
             </div>
             <div className="card__actions">
               {tester.running ? (
@@ -197,7 +217,7 @@ export function Zapret() {
 
           <div className="strategies" role="radiogroup" aria-label="Стратегии">
             {!ov && <Skeleton rows={6} />}
-            {ov && ov.strategies.length === 0 && <div className="muted">Сборка Zapret не найдена. Переустановите VELIORA App или установите версию ниже.</div>}
+            {ov && ov.strategies.length === 0 && <div className="muted">Сборка Zapret не найдена. Переустановите VELIORA App или установите версию выше.</div>}
             {sorted.map((s) => {
               const r = report?.results[s.file];
               const best = report?.best.includes(s.file);
@@ -286,25 +306,7 @@ export function Zapret() {
               <button className="btn" onClick={() => setConfirmReset('discord')}><Icon name="trash" size={16} /> Очистить кеш Discord</button>
             </section>
 
-            <section className="glass card">
-              <h2>Версия сборки</h2>
-              <p className="lead">Установлена <b>{ov?.version ?? '…'}</b>{ov?.source === 'update' ? ' (обновлена из приложения)' : ' (встроенная)'}. Источник — официальные релизы Flowseal/zapret-discord-youtube, установка только с проверкой SHA-256.</p>
-              {!releases ? (
-                <>
-                  <button className="btn" onClick={loadReleases}><Icon name="download" size={16} /> Показать доступные версии</button>
-                  {relError && <div className="field__error" style={{ marginTop: 8 }}>{relError}</div>}
-                </>
-              ) : (
-                <div className="input-row">
-                  <SelectBox label="Версия Zapret" value={pick} onChange={setPick}
-                    options={releases.map((r) => ({ value: r.tag, label: `${r.tag}${r.tag === ov?.version ? ' — установлена' : ''}${r.sha256 ? '' : ' — нет SHA-256'}` }))} />
-                  <button className="btn btn--primary" disabled={installing || !admin || tester.running || !releases.find((r) => r.tag === pick)?.sha256} onClick={install}>
-                    {installing ? <Spinner size={14} /> : <Icon name="download" size={16} />} Установить
-                  </button>
-                </div>
-              )}
-              {releases && <p className="field__hint" style={{ marginTop: 8 }}>Списки, которые вы добавили сами, перенесутся на выбранную версию.</p>}
-            </section>
+
           </div>
         </div>
       </div>

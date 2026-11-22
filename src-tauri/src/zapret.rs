@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 pub const PLACEHOLDER_DOMAIN: &str = "domain.example.abc";
 pub const PLACEHOLDER_IP: &str = "203.0.113.113/32";
 const USER_FILES: [&str; 4] = ["list-general-user.txt", "list-exclude-user.txt", "ipset-exclude-user.txt", "ipset-all-user.txt"];
-const WINDIVERT_SERVICES: [&str; 4] = ["WinDivert", "WinDivert14", "windivert", "WinDivert64"];
-const CONFLICTING_PROCESSES: [&str; 2] = ["goodbyedpi.exe", "zapret.exe"];
 
 /// Telegram networks, added to the IPSet in "basic" mode.
 const TELEGRAM_NETS: [&str; 10] = [
@@ -76,7 +74,7 @@ pub fn installed_version(resources: &Path) -> String {
     bundle_state(&runtime()).map(|s| s.version).unwrap_or_else(|| bundled_version(resources))
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for e in std::fs::read_dir(src)? {
         let e = e?;
@@ -109,13 +107,16 @@ pub fn finalize_install(staging: &Path, version: &str, source: &str) -> Result<(
     let mut carried = 0;
     for f in USER_FILES {
         let from = rt.join("lists").join(f);
-        if from.exists() && std::fs::copy(&from, staging.join("lists").join(f)).is_ok() {
-            carried += 1;
+        match std::fs::copy(&from, staging.join("lists").join(f)) {
+            Ok(_) => carried += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !from.exists() => {}
+            Err(error) => return Err(format!("Не удалось сохранить список {f}: {error}")),
         }
     }
     let state = BundleState { version: version.to_string(), source: source.to_string() };
     std::fs::write(staging.join("veliora.json"), serde_json::to_vec_pretty(&state).unwrap_or_default()).map_err(err)?;
     ensure_user_files(staging);
+    win::protected_tree(staging).map_err(err)?;
 
     let old = win::program_data().join("zapret.old");
     let _ = std::fs::remove_dir_all(&old);
@@ -126,10 +127,32 @@ pub fn finalize_install(staging: &Path, version: &str, source: &str) -> Result<(
         let _ = std::fs::rename(&old, &rt);
         return Err(format!("Не удалось заменить файлы Zapret: {e}"));
     }
-    let _ = std::fs::remove_dir_all(&old);
-    win::lock_down(&win::program_data());
     logs::info("zapret", format!("установлена сборка {version} ({source}), перенесено ваших списков: {carried}"));
     Ok(())
+}
+
+pub fn rollback_install() -> Result<(), String> {
+    let root=win::program_data();
+    let old=root.join("zapret.old");
+    let failed=root.join("zapret.failed");
+    if !old.is_dir() {return Err("Предыдущая сборка недоступна.".into());}
+    if failed.exists() {std::fs::remove_dir_all(&failed).map_err(|e| e.to_string())?;}
+    let current=runtime();
+    std::fs::rename(&current,&failed).map_err(|e|e.to_string())?;
+    if let Err(error)=std::fs::rename(&old,&current) {
+        let _=std::fs::rename(&failed,&current);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+pub fn protect_runtime() -> Result<(), String> {
+    if !win::is_admin() || !win::trusted_install() {
+        return Err("Установите VELIORA в Program Files, чтобы использовать Zapret с повышенными правами.".into());
+    }
+    let root = win::program_data();
+    win::create_protected_dir(&root).map_err(|e| format!("Недоступна защищённая папка Zapret: {e}"))?;
+    win::protected_tree(&root).map_err(|e| format!("Zapret остановлен: {e}"))
 }
 
 /// Creates or refreshes the working copy from the bundled files when needed.
@@ -137,13 +160,7 @@ pub fn prepare(resources: &Path) -> Result<(), String> {
     if !win::is_admin() {
         return Err("Нужны права администратора".into());
     }
-    // Once per run: (re)apply the folder ACL — also repairs folders locked by 2.0.0's first build.
-    static ACL_CHECKED: std::sync::Once = std::sync::Once::new();
-    ACL_CHECKED.call_once(|| {
-        if win::program_data().exists() && !win::lock_down(&win::program_data()) {
-            logs::warn("zapret", "не удалось обновить права папки VELIORA в ProgramData");
-        }
-    });
+    protect_runtime()?;
     let rt = runtime();
     let bundled_ver = bundled_version(resources);
     let state = bundle_state(&rt);
@@ -345,7 +362,18 @@ pub fn build_args(dir: &Path, file: &str, cfg: &ZapretConfig) -> Result<Vec<Stri
         }
         out.push(a);
     }
-    Ok(out)
+    if !crate::managed_sites::domains(&cfg.managed_sites, &cfg.managed_services, file).is_empty() {
+        let existing = format!("--hostlist={lists}list-general-user.txt");
+        let managed = format!("--hostlist={lists}{}", crate::managed_sites::HOST_FILE);
+        if !out.iter().any(|arg| arg == &existing) {
+            return Err("Эта стратегия не поддерживает каталог и пользовательские сайты VELIORA.".into());
+        }
+        out = out.into_iter().flat_map(|arg| {
+            let user_list = arg == existing;
+            std::iter::once(arg).chain(user_list.then(|| managed.clone()))
+        }).collect();
+    }
+    crate::discord::apply_udp_profile(out, cfg.discord_udp)
 }
 
 #[derive(Serialize, Clone)]
@@ -422,30 +450,33 @@ fn classify(line: &str) -> (&'static str, Option<Health>) {
     ("info", None)
 }
 
-/// winws.exe processes that don't belong to this VELIORA bundle.
-pub fn foreign_winws(dir: &Path) -> Vec<(u32, String)> {
-    let ours = dir.join("bin").join("winws.exe");
-    win::find_processes("winws.exe")
-        .into_iter()
-        .filter_map(|p| {
-            let path = win::process_path(p.pid);
-            match path {
-                Some(path) if path == ours => None,
-                Some(path) => Some((p.pid, path.display().to_string())),
-                None => Some((p.pid, "winws.exe".into())),
-            }
-        })
-        .collect()
-}
-
-fn windivert_preflight() {
-    for name in WINDIVERT_SERVICES {
-        if let Some(svc) = win::service(name) {
-            let file = win::service_file(&svc.binary);
-            if !svc.binary.is_empty() && !file.exists() {
-                logs::warn("zapret", format!("служба {name} указывает на удалённый файл {} — регистрация сброшена", file.display()));
-                win::service_stop(name);
-                win::service_delete(name);
+pub fn validate_install(dir: &Path, cfg: &ZapretConfig) -> Result<(), String> {
+    let bin = dir.join("bin");
+    if !["winws.exe", "WinDivert.dll", "WinDivert64.sys", "cygwin1.dll"].iter().all(|name| bin.join(name).is_file()) {
+        return Err("В архиве отсутствуют компоненты winws или WinDivert.".into());
+    }
+    if !dir.join("general.bat").is_file() || !dir.join("lists").is_dir() {
+        return Err("В архиве отсутствуют стратегия или списки Zapret.".into());
+    }
+    let Some(strategy) = &cfg.strategy else { return Ok(()); };
+    ensure_user_files(dir);
+    let domains = crate::managed_sites::domains(&cfg.managed_sites, &cfg.managed_services, strategy);
+    if !domains.is_empty() { crate::managed_sites::write(dir, &domains)?; }
+    let args = build_args(dir, strategy, cfg)?;
+    let mut child = win::hidden(bin.join("winws.exe")).arg("--dry-run").args(args).current_dir(&bin)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()).spawn()
+        .map_err(|e| format!("Не удалось проверить стратегию в выбранной версии: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("Выбранная версия отклонила стратегию «{strategy}» ({status}).")),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(80)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Проверка совместимости Zapret не завершилась.".into());
             }
         }
     }
@@ -454,11 +485,15 @@ fn windivert_preflight() {
 pub fn launch(c: &Arc<Component>, dir: &Path, file: &str, cfg: &ZapretConfig, quiet: bool) -> Result<u32, String> {
     let args = build_args(dir, file, cfg)?;
     ensure_user_files(dir);
+    let domains = crate::managed_sites::domains(&cfg.managed_sites, &cfg.managed_services, file);
+    if !domains.is_empty() {
+        crate::managed_sites::write(dir, &domains)?;
+    }
     write_ipset(dir, &cfg.ipset_mode)?;
     let mut cmd = win::hidden(dir.join("bin").join("winws.exe"));
     cmd.args(&args).current_dir(dir.join("bin"));
     if !quiet {
-        logs::info("zapret", format!("запуск стратегии «{}»", file.trim_end_matches(".bat")));
+        logs::info("zapret", format!("запуск стратегии «{}», Discord UDP: {:?}", file.trim_end_matches(".bat"), cfg.discord_udp));
     }
     c.spawn(cmd, if quiet { classify_quiet } else { classify })
 }
@@ -487,34 +522,33 @@ pub fn wait_ready(c: &Arc<Component>, timeout: Duration) -> Result<bool, String>
     }
 }
 
-pub fn preflight(dir: &Path) -> Result<(), String> {
+pub fn preflight(own_pid: Option<u32>) -> Result<(), String> {
     if !win::is_admin() {
         return Err("Zapret работает только с правами администратора. Нажмите «Запросить права» или перезапустите VELIORA App.".into());
     }
-    let foreign = foreign_winws(dir);
-    if let Some((_, path)) = foreign.first() {
-        return Err(format!("Уже работает другой обход блокировок ({path}). Выключите его в той программе — два обхода одновременно мешают друг другу."));
-    }
-    for name in CONFLICTING_PROCESSES {
-        if !win::find_processes(name).is_empty() {
-            return Err(format!("Запущена другая программа обхода блокировок ({name}). Закройте её и попробуйте снова."));
-        }
+    let conflicts = crate::zapret_conflicts::scan(own_pid, false);
+    if let Some(item) = conflicts.first() {
+        let reason = if item.confirmed { "WinDivert используется другой программой" } else { "Не удалось проверить другой сетевой процесс" };
+        return Err(format!("{reason}: {}. Откройте диагностику конфликта.", item.label));
     }
     if let Some(bfe) = win::service("BFE") {
         if !bfe.running() {
             return Err("Служба Windows «Базовый механизм фильтрации» (BFE) остановлена — без неё драйвер WinDivert не работает. Откройте диагностику на главной.".into());
         }
     }
-    windivert_preflight();
-    // Zapret's own scripts enable TCP timestamps before every start (needed by some desync modes).
-    let _ = win::run_tool("netsh.exe", &["interface", "tcp", "set", "global", "timestamps=enabled"]);
     Ok(())
+}
+
+fn filter_in_use(tail: &str) -> bool {
+    let text = tail.to_ascii_lowercase();
+    text.contains("0x8032000a") || text.contains("fwp_e_in_use") ||
+        (text.contains("windivert") && text.contains("object is referenced by other objects"))
 }
 
 pub fn start(c: &Arc<Component>, resources: &Path, cfg: &ZapretConfig) -> Result<(), String> {
     let _guard = c.op.lock();
     if c.alive() {
-        return Ok(());
+        return if c.status().state == "running" { Ok(()) } else { Err("Предыдущий процесс Zapret ещё завершается.".into()) };
     }
     let Some(file) = cfg.strategy.clone() else {
         return Err("Выберите стратегию на странице Zapret.".into());
@@ -527,26 +561,37 @@ pub fn start(c: &Arc<Component>, resources: &Path, cfg: &ZapretConfig) -> Result
     });
     prepare(resources).map_err(|e| c.fail(e))?;
     let dir = runtime();
-    preflight(&dir).map_err(|e| c.fail(e))?;
-    let pid = launch(c, &dir, &file, cfg, false).map_err(|e| c.fail(e))?;
-    match wait_ready(c, Duration::from_secs(5)) {
-        Ok(confirmed) => {
-            if !confirmed {
-                logs::warn("zapret", "winws.exe работает, но не сообщил о старте перехвата за 5 с — считаем, что всё в порядке");
+    preflight(None).map_err(|e| c.fail(e))?;
+    for attempt in 0..2 {
+        let pid = launch(c, &dir, &file, cfg, false).map_err(|e| c.fail(e))?;
+        match wait_ready(c, Duration::from_secs(5)) {
+            Ok(true) if c.mark_capture_ready(pid) => {
+                logs::info("zapret", "Перехват WinDivert подтверждён.");
+                return Ok(());
             }
-            c.set_status(|s| {
-                s.state = "running";
-                s.pid = Some(pid);
-            });
-            logs::info("zapret", "перехват трафика запущен");
-            Ok(())
-        }
-        Err(tail) => {
-            c.kill();
-            let hint = if tail.is_empty() { String::new() } else { format!(" Сообщение winws: {tail}") };
-            Err(c.fail(format!("Драйвер WinDivert не запустился. Проверьте антивирус и «Целостность памяти» в диагностике.{hint}")))
+            outcome => {
+                let tail = match outcome { Err(tail) => tail, _ => c.tail() };
+                c.kill();
+                if c.alive() {
+                    return Err(c.fail("Предыдущий процесс VELIORA ещё завершается. Повторите попытку позже."));
+                }
+                let filter_busy = filter_in_use(&tail);
+                if filter_busy && attempt == 0 && cfg.auto_resolve_conflicts {
+                    logs::warn("zapret", "Фильтр WinDivert занят. После освобождения ресурсов проверяем запуск ещё раз.");
+                    std::thread::sleep(Duration::from_millis(800));
+                    preflight(None).map_err(|e| c.fail(e))?;
+                    continue;
+                }
+                let message = if filter_busy {
+                    "Фильтр WinDivert всё ещё занят. Закройте другую программу обхода и повторите попытку. Если она закрыта, перезагрузите Windows."
+                } else {
+                    "Не удалось подтвердить запуск WinDivert. Проверьте подробности в журнале и откройте диагностику Zapret."
+                };
+                return Err(c.fail(message));
+            }
         }
     }
+    Err(c.fail("Не удалось запустить Zapret."))
 }
 
 pub fn stop(c: &Arc<Component>) {
@@ -556,18 +601,6 @@ pub fn stop(c: &Arc<Component>) {
         c.kill();
     }
     c.mark_stopped();
-}
-
-/// After VELIORA's winws is gone: unload the driver so its files aren't locked.
-/// The service stays registered (starting it later is faster and race-free).
-pub fn unload_driver() {
-    if win::find_processes("winws.exe").is_empty() {
-        for name in WINDIVERT_SERVICES {
-            if win::service(name).is_some_and(|s| s.running()) {
-                win::service_stop(name);
-            }
-        }
-    }
 }
 
 // ── lists ─────────────────────────────────────────────────────────────────
@@ -811,6 +844,34 @@ mod tests {
     }
 
     #[test]
+    fn managed_hostlist_extends_only_user_hostlist_sections() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("components").join("zapret");
+        let mut cfg = ZapretConfig::default();
+        let baseline = build_args(&dir, "general.bat", &cfg).unwrap();
+        cfg.managed_services.push("github".into());
+        cfg.managed_sites.push(crate::managed_sites::Site {
+            name: None, domain: "example.org".into(), enabled: true, strategy: Some("general.bat".into()),
+        });
+        let updated = build_args(&dir, "general.bat", &cfg).unwrap();
+        let mut restored = Vec::new();
+        let mut previous = "";
+        let mut inserted = 0;
+        for arg in &updated {
+            if arg.ends_with(crate::managed_sites::HOST_FILE) {
+                assert!(previous.ends_with("list-general-user.txt"));
+                inserted += 1;
+            } else {
+                restored.push(arg.clone());
+            }
+            previous = arg;
+        }
+        assert!(inserted > 0);
+        assert_eq!(baseline, restored);
+        assert!(baseline.iter().any(|arg| arg.ends_with("list-google.txt")));
+        assert!(read_entries(&dir.join("lists/list-google.txt")).iter().any(|entry| entry.contains("youtube")));
+    }
+
+    #[test]
     fn real_bundle_resolves() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("components").join("zapret");
         if !dir.exists() {
@@ -843,35 +904,60 @@ mod winws_args {
     fn winws_parses_every_strategy() {
         // Work on a copy prepared exactly like the runtime folder (user lists, ipset).
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("components").join("zapret");
-        let dir = std::env::temp_dir().join("veliora-winws-test");
+        let dir = std::env::temp_dir().join(format!("veliora-winws-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         copy_dir(&src, &dir).unwrap();
         ensure_user_files(&dir);
         let mut cfg = ZapretConfig::default();
-        for (mode, fake) in [("off", None), ("all", Some("stun.bin".to_string()))] {
-            cfg.game_filter = mode.into();
-            cfg.fake_discord = fake.clone();
-            cfg.fake_game = fake;
-            for ipset in ["basic", "full", "any"] {
-            cfg.ipset_mode = ipset.into();
-            write_ipset(&dir, ipset).unwrap();
-            for s in strategies(&dir) {
-                let args = build_args(&dir, &s.file, &cfg).unwrap();
-                // --dry-run: winws validates every option and exits. RunAsInvoker only skips the
-                // manifest's elevation request; the check itself needs no rights.
-                let out = std::process::Command::new(dir.join("bin").join("winws.exe"))
-                    .arg("--dry-run")
-                    .args(&args)
-                    .env("__COMPAT_LAYER", "RunAsInvoker")
-                    .current_dir(dir.join("bin"))
-                    .output()
-                    .unwrap();
-                let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).to_lowercase();
-                let parse_error = text.contains("invalid") || text.contains("unknown option") || text.contains("unrecognized") || text.contains("bad value") || text.contains("could not read");
-                let at_driver = out.status.success() || text.contains("windivert");
-                println!("{mode:>3} {ipset:<5} {:<34} exit={:?} {}", s.name, out.status.code(), text.lines().last().unwrap_or(""));
-                assert!(!parse_error && at_driver, "{} ({mode}/{ipset}): {text}", s.name);
-            }
+        for discord_udp in [
+            crate::config::DiscordUdp::Bundle,
+            crate::config::DiscordUdp::Direct,
+            crate::config::DiscordUdp::Discovery,
+        ] {
+            cfg.discord_udp = discord_udp;
+            for (mode, fake) in [("off", None), ("all", Some("stun.bin".to_string()))] {
+                cfg.game_filter = mode.into();
+                cfg.fake_discord = fake.clone();
+                cfg.fake_game = fake;
+                for ipset in ["basic", "full", "any"] {
+                    cfg.ipset_mode = ipset.into();
+                    write_ipset(&dir, ipset).unwrap();
+                    for s in strategies(&dir) {
+                        let args = build_args(&dir, &s.file, &cfg).unwrap();
+                        // --dry-run: winws validates every option and exits. RunAsInvoker only skips the
+                        // manifest's elevation request; the check itself needs no rights.
+                        let out = std::process::Command::new(dir.join("bin").join("winws.exe"))
+                            .arg("--dry-run")
+                            .args(&args)
+                            .env("__COMPAT_LAYER", "RunAsInvoker")
+                            .current_dir(dir.join("bin"))
+                            .output()
+                            .unwrap();
+                        let text = format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        )
+                        .to_lowercase();
+                        let parse_error = text.contains("invalid")
+                            || text.contains("unknown option")
+                            || text.contains("unrecognized")
+                            || text.contains("bad value")
+                            || text.contains("could not read");
+                        let at_driver = out.status.success() || text.contains("windivert");
+                        println!(
+                            "{mode:>3} {ipset:<5} {:<34} exit={:?} {}",
+                            s.name,
+                            out.status.code(),
+                            text.lines().last().unwrap_or("")
+                        );
+                        assert!(
+                            !parse_error && at_driver,
+                            "{} ({mode}/{ipset}): {text}",
+                            s.name
+                        );
+                    }
+                }
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

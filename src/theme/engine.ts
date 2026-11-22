@@ -32,7 +32,7 @@ export interface Appearance {
 }
 
 export const DEFAULT_APPEARANCE: Appearance = {
-  theme: 'liquid-dark',
+  theme: 'obsidian',
   custom: DEFAULT_CUSTOM,
   accent: null,
   blur: 1,
@@ -193,13 +193,16 @@ function motionState(a: Appearance) {
 }
 
 let current: { theme: ThemeDef; appearance: Appearance } | null = null;
+let pendingThemeWrite = 0;
 const listeners = new Set<() => void>();
 
 /** Writes the tokens to :root. `animate` crossfades the whole window (View Transitions). */
 export function apply(a: Appearance, animate = false) {
   const theme = resolveTheme(a);
   const root = document.documentElement;
+  const writeId = ++pendingThemeWrite;
   const write = () => {
+    if (writeId !== pendingThemeWrite) return;
     const vars = computeVars(theme, a);
     for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
     root.dataset.mode = theme.mode;
@@ -211,12 +214,14 @@ export function apply(a: Appearance, animate = false) {
     root.setAttribute('data-motion-override', '');
     current = { theme, appearance: a };
     listeners.forEach((l) => l());
+    void syncWindow(theme);
   };
-  const prevMode = root.dataset.theme;
-  const doc = document as Document & { startViewTransition?: (cb: () => void) => unknown };
-  if (animate && prevMode !== theme.id && doc.startViewTransition && a.uiAnimation && !a.reducedMotion) doc.startViewTransition(write);
-  else write();
-  syncWindow(theme);
+  const prevTheme = root.dataset.theme;
+  if (animate && prevTheme !== theme.id && document.startViewTransition && a.uiAnimation && !a.reducedMotion) {
+    const transition = document.startViewTransition(write);
+    // Chromium rejects ready when a newer choice supersedes the animation.
+    void transition.ready.catch(() => {});
+  } else write();
 }
 
 let lastBg = '';
@@ -225,6 +230,7 @@ async function syncWindow(t: ThemeDef) {
   lastBg = t.bg;
   try {
     const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    if (lastBg !== t.bg) return;
     const [r, g, b] = [1, 3, 5].map((i) => parseInt(t.bg.slice(i, i + 2), 16));
     await getCurrentWindow().setBackgroundColor([r, g, b, 255]);
   } catch {

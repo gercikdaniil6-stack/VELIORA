@@ -33,3 +33,6 @@ docs/promo/
 
 # local release checklist
 release-files.txt
+
+# App-local Microsoft Visual C++ redistributable staged by build.rs
+src-tauri/installer/vc-runtime/

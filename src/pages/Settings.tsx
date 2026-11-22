@@ -10,6 +10,7 @@ import { Confirm, Spinner } from '../components/ui';
 import { api, type AppPrefs } from '../lib/api';
 import { native } from '../lib/native';
 import { useCore } from '../state/core';
+import { AppUpdatesSettings } from '../state/appUpdates';
 import { useStore } from '../state/store';
 
 export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
@@ -66,7 +67,7 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
             <h2>Запуск</h2>
             <Setting title="Запускать вместе с Windows" desc="Через Планировщик заданий — сразу с правами администратора, без запроса UAC." checked={p.launchAtLogin} onChange={(v) => set({ launchAtLogin: v })} />
             <Setting title="Тихий старт" desc={tray ? 'Приложение запускается в трее, без окна.' : 'Сначала включите иконку в трее — без неё окно не вернуть.'} checked={p.silentStart} disabled={!tray} onChange={(v) => set({ silentStart: v })} />
-            <Setting title="Автозапуск Telegram-прокси" desc="Включает прокси при запуске VELIORA App." checked={core.config.tgws.autoStart}
+            <Setting title="Автозапуск локального прокси" desc="Включает локальный режим Telegram при запуске приложения." checked={core.config.tgws.autoStart}
               onChange={(v) => core.save((c) => ({ ...c, tgws: { ...c.tgws, autoStart: v } }), { quiet: true })} />
             <Setting title="Автозапуск Zapret" desc={core.config.zapret.strategy ? 'Включает обход при запуске VELIORA App.' : 'Сначала выберите стратегию на странице Zapret.'}
               checked={core.config.zapret.autoStart} disabled={!core.config.zapret.strategy}
@@ -74,8 +75,9 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
             <Setting title="Заставка при запуске" desc="Короткая анимация логотипа при открытии окна." checked={p.showSplash} onChange={(v) => set({ showSplash: v })} />
           </section>
 
+          <AppUpdatesSettings />
           <section className="glass card">
-            <h2>Обновления</h2>
+            <h2>Обновления компонентов</h2>
             <Setting title="Проверять обновления автоматически" desc="Сообщает о новых сборках Zapret и TgWsProxy на главной." checked={p.autoCheckUpdates} onChange={(v) => set({ autoCheckUpdates: v })} />
             <div className="setting">
               <div>
@@ -110,6 +112,21 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
 
           <section className="glass card">
             <h2>Дополнительно</h2>
+            <Setting title="Автоматически устранять конфликты Zapret"
+              desc="Одна попытка восстановить Zapret после сбоя. Сторонние службы останавливаются автоматически только после сохранённого разрешения."
+              checked={core.config.zapret.autoResolveConflicts ?? true}
+              onChange={(value) => core.save((c) => ({ ...c, zapret: { ...c.zapret, autoResolveConflicts: value } }), { quiet: true })} />
+            <div className="setting">
+              <div><div className="setting__title">Разрешения Zapret</div><div className="setting__desc">Отозвать сохранённые разрешения на остановку сторонних служб.</div></div>
+              <button className="btn" disabled={!core.info?.admin} onClick={() => void api.forgetZapretPermissions()
+                .then(() => toast.show({ tone: 'ok', title: 'Разрешения отозваны' }))
+                .catch((e: Error) => toast.show({ tone: 'error', title: 'Не удалось отозвать разрешения', body: e.message }))}>Отозвать</button>
+            </div>
+            <div className="home-actions">
+              <button className="btn" onClick={() => onNavigate('lists')}><Icon name="lists" /> Списки Zapret</button>
+              <button className="btn" onClick={() => onNavigate('logs')}><Icon name="logs" /> Журнал</button>
+              <button className="btn" onClick={() => onNavigate('about')}><Icon name="about" /> О приложении</button>
+            </div>
             <div className="setting">
               <div><div className="setting__title">Перезапустить приложение</div><div className="setting__desc">Telegram-прокси и Zapret остановятся; без автозапуска их нужно будет включить снова.</div></div>
               <button className="btn" onClick={() => setConfirm('restart')}>Перезапустить</button>

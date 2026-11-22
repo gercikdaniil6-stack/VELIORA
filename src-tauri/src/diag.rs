@@ -40,6 +40,7 @@ pub struct Ctx<'a> {
     pub tgws: &'a TgwsConfig,
     pub tgws_running: bool,
     pub own_proxy_active: bool,
+    pub zapret_pid: Option<u32>,
 }
 
 pub fn run(ctx: &Ctx) -> DiagReport {
@@ -152,43 +153,26 @@ pub fn run(ctx: &Ctx) -> DiagReport {
         }
     }
 
-    // 5. Other bypass tools
-    let foreign = zapret::foreign_winws(&zdir);
-    let mut conflicts: Vec<String> = foreign.iter().map(|(_, p)| p.clone()).collect();
-    for p in ["goodbyedpi.exe", "zapret.exe"] {
-        if !win::find_processes(p).is_empty() {
-            conflicts.push(p.to_string());
-        }
-    }
     let services = win::services_all();
-    let conflict_svcs: Vec<String> = services
-        .iter()
-        .filter(|s| ["goodbyedpi", "zapret", "discordfix_zapret", "winws1", "winws2"].iter().any(|n| s.name.eq_ignore_ascii_case(n)))
-        .map(|s| s.name.clone())
-        .collect();
-    if conflicts.is_empty() && conflict_svcs.is_empty() {
+    // 5. Other bypass tools
+    let conflicts = crate::zapret_conflicts::scan(ctx.zapret_pid, false);
+    if conflicts.is_empty() {
         passed.push("Другие программы обхода".into());
     } else {
-        let mut detail = String::new();
-        if !conflicts.is_empty() {
-            detail.push_str(&format!("Сейчас работает: {}. ", conflicts.join(", ")));
-        }
-        if !conflict_svcs.is_empty() {
-            detail.push_str(&format!("Установлены службы автозапуска: {}. ", conflict_svcs.join(", ")));
-        }
-        detail.push_str("Две программы обхода через WinDivert мешают друг другу: трафик обрабатывается дважды или не обрабатывается вовсе.");
         issues.push(Issue {
-            id: "conflict",
-            severity: "error",
-            title: "Работает другая программа обхода блокировок".into(),
-            impact: "Zapret будет конфликтовать с ней.".into(),
-            detail,
-            steps: vec![
-                "Выключите обход в той программе (Slipgate, GoodbyeDPI, другой Zapret) или закройте её.".into(),
-                "Если это служба Windows — остановите её и отключите автозапуск командами ниже (командная строка администратора).".into(),
-            ],
-            commands: conflict_svcs.iter().flat_map(|s| [format!("sc stop {s}"), format!("sc config {s} start= disabled")]).collect(),
-            actions: vec![Action { kind: "taskmgr", label: "Диспетчер задач" }],
+            id: "conflict", severity: "error",
+            title: "Обнаружена другая сетевая программа".into(),
+            impact: "Она может использовать тот же механизм фильтрации.".into(),
+            detail: {
+                let processes = conflicts.iter().map(|item| format!("{} (PID {})", item.label, item.pid)).collect::<Vec<_>>().join(", ");
+                let drivers = crate::zapret_conflicts::drivers().into_iter().map(|driver|
+                    format!("{} · {}", driver.name, match driver.state { 4 => "работает", 1 => "остановлена", _ => "переходное состояние" }))
+                    .collect::<Vec<_>>().join(", ");
+                if drivers.is_empty() { processes } else { format!("{processes}. Службы драйвера: {drivers}.") }
+            },
+            steps: vec!["При включении VELIORA предложит безопасную остановку, если Windows подтверждает владельца службы.".into(),
+                "Если такой вариант недоступен, выключите обход в указанном приложении и повторите попытку.".into()],
+            commands: vec![], actions: vec![],
         });
     }
 

@@ -4,8 +4,8 @@
 .backdrop { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; contain: strict; }
 .backdrop__wash { position: absolute; inset: 0; background: linear-gradient(180deg, var(--bg-a) 0%, var(--bg) 55%, var(--bg-b) 100%); }
 .backdrop__light {
-  position: absolute; border-radius: 50%; will-change: transform;
-  transform: translate3d(0, calc(var(--scroll, 0) * var(--par, -0.04) * 1px), 0);
+  position: absolute; border-radius: 50%;
+  transform: translateY(calc(var(--scroll, 0) * var(--par, -0.04) * 1px));
 }
 .backdrop__light--1 { --par: -0.06; width: 980px; height: 720px; left: -18%; top: -26%; background: radial-gradient(closest-side, var(--blob-1), transparent); }
 .backdrop__light--2 { --par: -0.03; width: 920px; height: 760px; right: -20%; bottom: -30%; background: radial-gradient(closest-side, var(--blob-2), transparent); }
@@ -16,7 +16,9 @@
 :root[data-bg-anim='on'] .backdrop__light--2 { animation: drift-b 46s ease-in-out infinite alternate; }
 :root[data-bg-anim='on'] .backdrop__light--3 { animation: drift-c 31s ease-in-out infinite alternate; }
 :root[data-bg-anim='on'] .backdrop__light--4 { animation: drift-d 53s ease-in-out infinite alternate; }
+:root[data-bg-anim='on'] .backdrop[data-active='false'] .backdrop__light,
 :root[data-hidden='true'] .backdrop__light, :root[data-hidden='true'] .orb__halo { animation-play-state: paused !important; }
+:root:is([data-theme='obsidian'], [data-theme='midnight']) .backdrop__light:not(.backdrop__light--1) { animation: none; }
 @keyframes drift-a { 0% { translate: 0 0; scale: 1; } 50% { translate: 9vw 6vh; scale: 1.08; } 100% { translate: 3vw 12vh; scale: 0.96; } }
 @keyframes drift-b { 0% { translate: 0 0; scale: 1; } 50% { translate: -10vw -7vh; scale: 1.1; } 100% { translate: -4vw -14vh; scale: 1; } }
 @keyframes drift-c { 0% { translate: 0 0; opacity: 0.8; } 50% { translate: -12vw 9vh; opacity: 1; } 100% { translate: 6vw -6vh; opacity: 0.7; } }

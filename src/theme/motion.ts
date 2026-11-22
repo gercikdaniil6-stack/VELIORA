@@ -6,21 +6,23 @@ const GLOW_TARGETS = '.glass, .tile, .strategy, .ipset__opt, .credit, .theme-car
  * One window-level listener for the light that follows the cursor across glass:
  * writes --mx/--my on the surface under the pointer, at most once per frame.
  */
-export function useGlassPointer() {
+export function useGlassPointer(route: string) {
   useEffect(() => {
     let raf = 0;
     let last: PointerEvent | null = null;
     let lit: HTMLElement | null = null;
     const frame = () => {
       raf = 0;
-      if (!last) return;
-      const el = (last.target as Element | null)?.closest?.(GLOW_TARGETS) as HTMLElement | null;
+      const event = last;
+      last = null;
+      if (!event) return;
+      const el = (event.target as Element | null)?.closest?.(GLOW_TARGETS) as HTMLElement | null;
       if (lit && lit !== el) lit.classList.remove('is-lit');
       lit = el;
       if (!el) return;
       const r = el.getBoundingClientRect();
-      el.style.setProperty('--mx', `${last.clientX - r.left}px`);
-      el.style.setProperty('--my', `${last.clientY - r.top}px`);
+      el.style.setProperty('--mx', `${event.clientX - r.left}px`);
+      el.style.setProperty('--my', `${event.clientY - r.top}px`);
       el.classList.add('is-lit');
     };
     const move = (e: PointerEvent) => {
@@ -32,10 +34,11 @@ export function useGlassPointer() {
     document.documentElement.addEventListener('pointerleave', leave);
     return () => {
       cancelAnimationFrame(raf);
+      leave();
       window.removeEventListener('pointermove', move);
       document.documentElement.removeEventListener('pointerleave', leave);
     };
-  }, []);
+  }, [route]);
 }
 
 /**

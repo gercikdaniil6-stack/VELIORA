@@ -56,9 +56,33 @@ fn prune(dir: &PathBuf) {
     }
 }
 
+/// Sanitize before a line reaches the journal, disk, exports, or error tails.
+pub(crate) fn redact(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut redacted = String::with_capacity(text.len().min(4096));
+    let mut from = 0;
+    while let Some((start, prefix)) = ["tg://proxy?", "https://t.me/proxy?", "secret=", "--secret ", "authorization:"]
+        .iter().filter_map(|prefix| lower[from..].find(prefix).map(|at| (from + at, *prefix))).min_by_key(|(at, _)| *at)
+    {
+        redacted.push_str(&text[from..start]);
+        let value = start + prefix.len();
+        if prefix == "authorization:" || prefix == "--secret " {
+            redacted.push_str(prefix);
+            redacted.push_str("[скрыто]");
+            // Quoted values or authorization schemes can contain spaces.
+            return redacted.chars().take(4096).collect();
+        }
+        if prefix == "secret=" { redacted.push_str(prefix); }
+        redacted.push_str("[скрыто]");
+        from = text[value..].find(|c:char|c.is_whitespace()).map_or(text.len(),|i|value+i);
+    }
+    redacted.push_str(&text[from..]);
+    redacted.chars().take(4096).collect()
+}
+
 pub fn log(source: &'static str, level: &'static str, text: impl Into<String>) {
     let text: String = text.into();
-    let text = text.trim_end().to_string();
+    let text = redact(text.trim_end());
     if text.is_empty() {
         return;
     }
@@ -109,4 +133,16 @@ pub fn export(path: &str) -> Result<usize, String> {
     }
     std::fs::write(path, out).map_err(|e| format!("Не удалось сохранить файл: {e}"))?;
     Ok(ring.len())
+}
+
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn secrets_are_removed_from_logs_and_tails() {
+        for line in ["ready tg://proxy?server=example.org&SECRET=value", "argument --secret \"value\"", "Authorization: Bearer value", "key Secret=value"] {
+            assert!(!super::redact(line).contains("value"));
+        }
+        assert_eq!(super::redact("HTTP 603"), "HTTP 603");
+    }
 }
