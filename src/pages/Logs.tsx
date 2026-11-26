@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { useToast } from '../components/Toast';
 import { Seg } from '../components/ui';
-import { api, listen, pickFile, type LogEntry } from '../lib/api';
+import { api, copyText, listen, pickFile, type LogEntry } from '../lib/api';
 
 const SOURCES: { id: 'all' | LogEntry['source']; label: string }[] = [
   { id: 'all', label: 'Все' },
@@ -55,12 +55,22 @@ export function Logs() {
     if (follow && box.current) box.current.scrollTop = box.current.scrollHeight;
   }, [shown, follow]);
 
+  const copyProblems = async () => {
+    const errors = shown.filter((entry) => entry.level !== 'info');
+    try {
+      await copyText(errors.map((entry) => [time(entry.time), SRC_LABEL[entry.source], entry.text].join(' · ')).join('\n'));
+      toast.show({ tone: 'ok', title: 'Ошибки скопированы', body: 'Перед отправкой проверьте текст на личные данные.' });
+    } catch {
+      toast.show({ tone: 'error', title: 'Не удалось скопировать ошибки' });
+    }
+  };
+
   const exportLogs = async () => {
     try {
-      const path = await pickFile({ save: true, title: 'Сохранить журнал', defaultPath: `veliora-log-${new Date().toISOString().slice(0, 10)}.txt` });
+      const path = await pickFile({ save: true, title: 'Сохранить отчёт для поддержки', defaultPath: `veliora-log-${new Date().toISOString().slice(0, 10)}.txt` });
       if (!path) return;
       const n = await api.logsExport(path);
-      toast.show({ tone: 'ok', title: 'Журнал сохранён', body: `${n} записей. Перед отправкой проверьте файл на личные данные.` });
+      toast.show({ tone: 'ok', title: 'Сохранён отчёт для поддержки', body: `${n} записей с категориями ошибок.` });
     } catch (e) {
       toast.show({ tone: 'error', title: 'Не удалось сохранить журнал', body: (e as Error).message });
     }
@@ -74,7 +84,8 @@ export function Logs() {
           <p>События Telegram-прокси, Zapret, теста стратегий и самого приложения. Хранится 7 дней.</p>
         </div>
         <div className="page-head__actions">
-          <button className="btn" onClick={exportLogs}><Icon name="download" size={16} /> Сохранить в файл</button>
+          <button className="btn" onClick={exportLogs}><Icon name="download" size={16} /> Сохранить отчёт</button>
+          <button className="btn btn--ghost" disabled={!shown.some((entry) => entry.level !== 'info')} onClick={copyProblems}>Скопировать ошибки</button>
           <button className="btn btn--ghost" onClick={() => { api.logsClear().catch(() => {}); setLogs([]); }}><Icon name="trash" size={16} /> Очистить</button>
         </div>
       </div>

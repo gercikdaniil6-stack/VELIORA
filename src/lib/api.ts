@@ -1,6 +1,7 @@
 // Typed bridge to the Rust core (Telegram proxy, Zapret, tester, logs…).
 // In a plain browser (vite preview) there is no Tauri runtime: calls return
 // neutral defaults so the UI still renders; actions report "only in the app".
+import type { Channel } from '@tauri-apps/api/core';
 import { isTauri } from './native';
 
 export type CoreState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error';
@@ -99,6 +100,7 @@ export interface StrategyResult {
   services: Record<string, [number, number]>;
   score: number;
   rechecked: boolean;
+  startupError?: string | null;
 }
 export interface TestReport {
   ranAt: number;
@@ -127,7 +129,7 @@ export interface UpdateCheck {
 
 export interface DiagAction { kind: string; label: string }
 export interface DiagIssue { id: string; severity: 'error' | 'warn'; title: string; impact: string; detail: string; steps: string[]; commands: string[]; actions: DiagAction[] }
-export interface DiagReport { issues: DiagIssue[]; passed: string[]; admin: boolean }
+export interface DiagReport { issues: DiagIssue[]; passed: string[]; admin: boolean; closeOffer?: { token: string; label: string } | null; checks: { name: string; status: string; detail: string }[] }
 
 export const PREVIEW_ERROR = 'Доступно только в приложении VELIORA App';
 
@@ -168,7 +170,7 @@ export const api = {
 
   configGet: () => call<Config>('config_get', undefined, DEFAULT_CONFIG),
   configSet: (config: Config) => call<{ config: Config; restart: ('tgws' | 'zapret')[] }>('config_set', { config }),
-  configFactoryReset: () => call<Config>('config_factory_reset'),
+  configFactoryReset: (progress: Channel<string>) => call<{ online: boolean; possibleConflicts: number }>('config_factory_reset', { progress }),
 
   logsHistory: () => call<LogEntry[]>('logs_history', undefined, []),
   logsClear: () => call<void>('logs_clear', undefined, undefined as unknown as void),
@@ -217,7 +219,8 @@ export const api = {
   installZapret: (tag: string) => call<{ version: string; strategies: number }>('updates_zapret_install', { tag }),
   checkUpdates: () => call<UpdateCheck>('updates_check'),
 
-  diagRun: () => call<DiagReport>('diag_run', undefined, { issues: [], passed: [], admin: false }),
+  diagCloseListener: (token: string) => call<boolean>('diag_close_listener', { token }, false),
+  diagRun: () => call<DiagReport>('diag_run', undefined, { issues: [], passed: [], admin: false, checks: [] }),
   diagOpen: (kind: string) => call<void>('diag_open', { kind }),
 };
 

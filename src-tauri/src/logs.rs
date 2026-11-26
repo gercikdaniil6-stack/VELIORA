@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter};
 
 const CAPACITY: usize = 3000;
 const KEEP_DAYS: u64 = 7;
+const DAILY_LIMIT: u64 = 2 * 1024 * 1024;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +28,7 @@ pub struct LogEntry {
 struct Logger {
     ring: Mutex<VecDeque<LogEntry>>,
     next: AtomicU64,
+    disk: Mutex<()>,
     app: OnceLock<AppHandle>,
     dir: OnceLock<PathBuf>,
 }
@@ -34,7 +36,7 @@ struct Logger {
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 fn logger() -> &'static Logger {
-    LOGGER.get_or_init(|| Logger { ring: Mutex::new(VecDeque::with_capacity(CAPACITY)), next: AtomicU64::new(1), app: OnceLock::new(), dir: OnceLock::new() })
+    LOGGER.get_or_init(|| Logger { ring: Mutex::new(VecDeque::with_capacity(CAPACITY)), next: AtomicU64::new(1), disk: Mutex::new(()), app: OnceLock::new(), dir: OnceLock::new() })
 }
 
 pub fn init(app: &AppHandle, dir: PathBuf) {
@@ -96,10 +98,17 @@ pub fn log(source: &'static str, level: &'static str, text: impl Into<String>) {
         ring.push_back(entry.clone());
     }
     if let Some(dir) = l.dir.get() {
+        let _disk = l.disk.lock();
         let (y, m, d) = crate::win::local_date();
         let path = dir.join(format!("{y:04}-{m:02}-{d:02}.log"));
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{} [{}] {}: {}", entry.time, source, level, entry.text);
+        let line = format!("{} [{}] {}: {}\n", entry.time, source, level, entry.text);
+        if path.metadata().is_ok_and(|meta| meta.len().saturating_add(line.len() as u64) > DAILY_LIMIT) {
+            let _ = std::fs::rename(&path, dir.join(format!("{y:04}-{m:02}-{d:02}.previous.log")));
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if file.metadata().is_ok_and(|meta| meta.len().saturating_add(line.len() as u64) <= DAILY_LIMIT) {
+                let _ = file.write_all(line.as_bytes());
+            }
         }
     }
     if let Some(app) = l.app.get() {
@@ -125,11 +134,31 @@ pub fn clear() {
     logger().ring.lock().clear();
 }
 
+// Only fixed categories are shared. Native errors can contain arbitrary
+// paths, endpoints, credentials and fragments of configuration.
+fn export_reason(text: &str) -> &'static str {
+    let text = text.to_ascii_lowercase();
+    let reasons = [
+        ("0x8032000a", "WinDivert: фильтр используется (0x8032000A)"),
+        ("object is referenced by other objects", "WinDivert: фильтр используется"),
+        ("требует прав администратора", "Нужны права администратора"),
+        ("нужны права администратора", "Нужны права администратора"),
+        ("файл программы не найден", "Исполняемый файл отсутствует"),
+        ("timeout", "Истекло время ожидания"),
+        ("истекло время ожидания", "Истекло время ожидания"),
+        ("не удалось запустить стратегию", "Ошибка запуска стратегии"),
+        ("winws.exe завершился", "winws.exe завершился"),
+        ("windivert", "Событие WinDivert"),
+    ];
+    reasons.iter().find_map(|(marker, label)| text.contains(marker).then_some(*label))
+        .unwrap_or("Подробности доступны в локальном журнале")
+}
+
 pub fn export(path: &str) -> Result<usize, String> {
     let ring = logger().ring.lock().clone();
-    let mut out = String::new();
+    let mut out = format!("VELIORA {} · диагностический отчёт\r\n", env!("CARGO_PKG_VERSION"));
     for e in &ring {
-        out.push_str(&format!("{}\t{}\t{}\t{}\r\n", e.time, e.source, e.level, e.text));
+        out.push_str(&format!("{}\t{}\t{}\t{}\r\n", e.time, e.source, e.level, export_reason(&e.text)));
     }
     std::fs::write(path, out).map_err(|e| format!("Не удалось сохранить файл: {e}"))?;
     Ok(ring.len())
@@ -138,6 +167,13 @@ pub fn export(path: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn support_export_omits_arbitrary_process_output() {
+        let private = r"WinDivert error 0x8032000a C:\Users\PrivateUser\example secret=private";
+        assert_eq!(super::export_reason(private), "WinDivert: фильтр используется (0x8032000A)");
+        assert_eq!(super::export_reason("https://user:password@example.org"), "Подробности доступны в локальном журнале");
+    }
+
     #[test]
     fn secrets_are_removed_from_logs_and_tails() {
         for line in ["ready tg://proxy?server=example.org&SECRET=value", "argument --secret \"value\"", "Authorization: Bearer value", "key Secret=value"] {

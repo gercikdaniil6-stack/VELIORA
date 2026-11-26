@@ -6,7 +6,9 @@ import { Setting } from '../components/bits';
 import { useCore } from './core';
 import { api } from '../lib/api';
 
-const CHECK_INTERVAL = 6 * 60 * 60 * 1000;
+const CHECK_INTERVAL = 45 * 60 * 1000;
+const RECOVERY_INTERVAL = 5 * 60 * 1000;
+const MAX_RETRY = 2 * 60 * 60 * 1000;
 const SNOOZE = 4 * 60 * 60 * 1000;
 type Offer = { version: string; notes: string };
 type CheckResult = { latest: string | null; offer: Offer | null };
@@ -35,22 +37,27 @@ export function AppUpdateProvider({ children }: { children: ReactNode }) {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState('');
   const active = useRef(false);
+  const lastAttempt = useRef(0);
+  const failures = useRef(0);
   const snoozeTimer = useRef<number | null>(null);
 
   const performCheck = useCallback(async (manual: boolean) => {
     if (!isTauri() || active.current) return;
     active.current = true;
+    lastAttempt.current = Date.now();
     setChecking(true);
     setError('');
     try {
       const { offer: update, latest: version } = await invoke<CheckResult>('app_update_check');
       setLatest(version);
       setOffer(update);
+      failures.current = 0;
       setCheckedAt(Date.now());
       let reminder = 0;
       try { if (update) reminder = Number(localStorage.getItem('veliora.update.snooze.' + update.version)); } catch { /* optional preference */ }
       setOpen(Boolean(update && (manual || reminder <= Date.now())));
     } catch (cause) {
+      failures.current = Math.min(failures.current + 1, 6);
       setError(message(cause));
     } finally {
       setChecking(false);
@@ -60,9 +67,35 @@ export function AppUpdateProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!loaded || !config.app.appAutoCheckUpdates) return;
-    const startup = window.setTimeout(() => { void performCheck(false); }, 1800);
-    const interval = window.setInterval(() => { void performCheck(false); }, CHECK_INTERVAL);
-    return () => { window.clearTimeout(startup); window.clearInterval(interval); };
+    let timer = 0;
+    let disposed = false;
+    const delay = () => failures.current
+      ? Math.min(MAX_RETRY, RECOVERY_INTERVAL * 2 ** (failures.current - 1))
+      : CHECK_INTERVAL;
+    const schedule = (wait: number) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => { void run(); }, wait);
+    };
+    const run = async () => {
+      if (navigator.onLine) await performCheck(false);
+      if (!disposed) schedule(delay() + Math.floor(Math.random() * 120_000));
+    };
+    const recover = () => {
+      if (document.hidden || !navigator.onLine || active.current) return;
+      const minimum = failures.current ? delay() : RECOVERY_INTERVAL;
+      if (Date.now() - lastAttempt.current >= minimum) schedule(1800);
+    };
+    schedule(1800);
+    window.addEventListener('online', recover);
+    window.addEventListener('focus', recover);
+    document.addEventListener('visibilitychange', recover);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      window.removeEventListener('online', recover);
+      window.removeEventListener('focus', recover);
+      document.removeEventListener('visibilitychange', recover);
+    };
   }, [loaded, config.app.appAutoCheckUpdates, performCheck]);
   useEffect(() => () => { if (snoozeTimer.current !== null) window.clearTimeout(snoozeTimer.current); }, []);
 

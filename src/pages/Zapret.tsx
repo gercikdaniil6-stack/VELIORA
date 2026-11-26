@@ -13,7 +13,7 @@ const validPorts = (s: string) => PORTS_RE.test(s) && s.split(',').every((p) => 
 });
 
 function resultLine(r: StrategyResult) {
-  if (r.status === 'not_started') return 'winws.exe не запустился с этой стратегией — она не оценена';
+  if (r.status === 'not_started') return r.startupError || 'Не удалось запустить стратегию. Подробности в журнале.';
   const parts: string[] = [];
   parts.push(r.blockedTotal ? `открыла ${r.opened} из ${r.blockedTotal} заблокированных` : 'ничего не было заблокировано');
   if (r.broken) parts.push(`сломала ${r.broken} работавших`);
@@ -204,12 +204,15 @@ export function Zapret() {
 
           {report && !tester.running && (
             <div className="test-notes">
-              {report.vpn && <Banner tone="warn" title={`Тест шёл через VPN-туннель «${report.vpn}»`}>Трафик уходил в туннель, поэтому результаты описывают VPN, а не вашу сеть. Выключите туннель и перетестируйте.</Banner>}
+              {report.vpn && !/teredo/i.test(report.vpn) && <Banner tone="warn" title={`Контрольный IPv4-маршрут через VPN-адаптер «${report.vpn}»`}>VPN может влиять на результаты. Маршруты отдельных сервисов могут отличаться.</Banner>}
               {report.systemProxy && <div className="note"><Icon name="info" size={15} /> В Windows включён системный прокси — тест измерял прямое подключение.</div>}
               <div className="note"><Icon name="info" size={15} />
                 {report.blocked.length ? <>Без обхода не открывались: <b>{report.blocked.join(', ')}</b>.</> : 'Без обхода открывалось всё — стратегии ранжированы по скорости и по тому, что они не ломают.'}
               </div>
-              {report.unfixable.length > 0 && <div className="note note--warn"><Icon name="alert" size={15} /> Ни одна стратегия не открыла: <b>{report.unfixable.join(', ')}</b> — вероятно, блокировка по IP.</div>}
+              {report.tested > 0 && !Object.values(report.results).some((result) => result.status !== 'not_started') &&
+                <div className="note note--warn"><Icon name="alert" size={15} /> Стратегии не запустились. Доступность с Zapret не проверена. Откройте журнал, чтобы увидеть ошибки запуска.</div>}
+              {report.unfixable.some((service) => Object.values(report.results).some((result) => service in result.services)) &&
+                <div className="note note--warn"><Icon name="alert" size={15} /> Запущенные стратегии не подтвердили доступность: <b>{report.unfixable.filter((service) => Object.values(report.results).some((result) => service in result.services)).join(', ')}</b>.</div>}
               {report.dnsIssues.length > 0 && <div className="note note--warn"><Icon name="alert" size={15} /> Проблема DNS или подменённый сертификат: <b>{report.dnsIssues.join(', ')}</b>. Поможет защищённый DNS (DoH) в браузере или Windows.</div>}
               {report.cancelled && <div className="note"><Icon name="info" size={15} /> Тест был остановлен: проверено {report.tested} из {report.total}.</div>}
             </div>

@@ -271,27 +271,77 @@ fn apply_config(app: &AppHandle, mut next: Config) -> Result<ConfigResult, Strin
     Ok(ConfigResult { config: next, restart })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkResetResult {
+    online: bool,
+    possible_conflicts: usize,
+}
+
 #[tauri::command]
-async fn config_factory_reset(app: AppHandle) -> Result<Config, String> {
+async fn config_factory_reset(
+    app: AppHandle, progress: tauri::ipc::Channel<&'static str>,
+) -> Result<NetworkResetResult, String> {
+    let report_app = app.clone();
+    let reset_progress = progress.clone();
     blocking(move || {
         let st = app.state::<AppState>();
         let _maintenance = st.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
-        if st.tester.is_running() || st.quitting.load(Ordering::SeqCst) { return Err("Дождитесь окончания текущей операции.".into()); }
-        tgws::stop(&st.tgws);
-        zapret::stop(&st.zapret);
-        st.tester.reset();
-        let _ = autorun::disable();
-        let mut fresh = Config::default();
-        // Keep the look the user chose; everything else back to defaults.
-        let prev = st.cfg();
-        fresh.app.reduce_transparency = prev.app.reduce_transparency;
-        fresh.appearance = prev.appearance;
-        fresh.zapret.managed_sites = prev.zapret.managed_sites;
-        fresh.zapret.managed_services = prev.zapret.managed_services;
-        fresh.zapret.managed_revision = prev.zapret.managed_revision;
-        apply_config(&app, fresh).map(|r| r.config)
-    })
-    .await
+        if st.tester.is_running() || st.quitting.load(Ordering::SeqCst) {
+            return Err("Дождитесь окончания текущей операции.".into());
+        }
+        let _ = reset_progress.send("Останавливаем Telegram и Zapret");
+        let reset = || -> Result<(), String> {
+            tgws::stop(&st.tgws);
+            zapret::stop(&st.zapret);
+            if st.tgws.alive() || st.zapret.alive() {
+                return Err("Один из процессов VELIORA ещё не завершился. Откройте диагностику и повторите сброс.".into());
+            }
+
+            let _ = reset_progress.send("Восстанавливаем системный прокси");
+            let mut snapshot = st.snapshot.lock();
+            if snapshot.is_none() && snapshot_path(&app)?.try_exists().map_err(|error| error.to_string())? {
+                return Err("Сохранилась точка восстановления прокси. Перезапустите приложение и проверьте журнал.".into());
+            }
+            restore_proxy(&app, &mut snapshot)?;
+            drop(snapshot);
+
+            let _ = reset_progress.send("Восстанавливаем настройки VELIORA");
+            let previous = st.cfg();
+            let mut fresh = Config::default();
+            fresh.app.reduce_transparency = previous.app.reduce_transparency;
+            fresh.appearance = previous.appearance;
+            fresh.zapret.managed_sites = previous.zapret.managed_sites;
+            fresh.zapret.managed_services = previous.zapret.managed_services;
+            fresh.zapret.managed_revision = previous.zapret.managed_revision;
+            apply_config(&app, fresh)?;
+            st.tester.reset();
+            Ok(())
+        };
+        let result = if let Some(catalog) = app.try_state::<Arc<catalog::Catalog>>() {
+            tauri::async_runtime::block_on(catalog.with_relay_stopped(&app, reset)).and_then(|result| result)
+        } else {
+            reset()
+        };
+        if result.is_err() {
+            logs::warn("app", "Сброс сети VELIORA выполнен не полностью.");
+        }
+        result
+    }).await?;
+
+    let _ = progress.send("Проверяем доступ к интернету");
+    let online = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(6)).build()
+    {
+        Ok(client) => client.get("https://www.msftconnecttest.com/connecttest.txt").send().await
+            .is_ok_and(|response| response.status().is_success()),
+        Err(_) => false,
+    };
+    let possible_conflicts = blocking(|| crate::zapret_conflicts::scan(None, false).len()).await;
+    logs::info("app", format!("Сброс сети VELIORA: контрольный HTTPS {}, возможных конфликтов {}.",
+        if online { "успешен" } else { "не подтверждён" }, possible_conflicts));
+    refresh_tray(&report_app);
+    Ok(NetworkResetResult { online, possible_conflicts })
 }
 
 // ── logs ──────────────────────────────────────────────────────────────────
@@ -865,15 +915,71 @@ async fn updates_check(app: AppHandle) -> UpdateCheck {
 
 #[tauri::command]
 async fn diag_run(app: AppHandle) -> diag::DiagReport {
-    blocking(move || {
-        let st = app.state::<AppState>();
+    let handle = app.clone();
+    let mut report = blocking(move || {
+        let st = handle.state::<AppState>();
         let res = st.resources();
         let cfg = st.cfg();
         let own_proxy = st.snapshot.lock().is_some();
-        let report = diag::run(&diag::Ctx { resources: &res, tgws: &cfg.tgws, tgws_running: st.tgws.alive(), own_proxy_active: own_proxy, zapret_pid: st.zapret.status().pid });
+        let zapret = st.zapret.status();
+        let mut report = diag::run(&diag::Ctx {
+            resources: &res, tgws: &cfg.tgws, tgws_pid: st.tgws.status().pid,
+            own_proxy_active: own_proxy, zapret_pid: zapret.pid,
+        });
+        report.checks.push(match zapret.state {
+            "running" => diag::check("Zapret", "Запущен", "Запуск подтверждён. Доступность сервисов проверяется отдельно."),
+            "error" => diag::check("Zapret", "Ошибка запуска", "Откройте журнал Zapret для подробностей."),
+            _ => diag::check("Zapret", "Нет активного запуска", "Доступность сервисов с Zapret не проверялась."),
+        });
         report
-    })
-    .await
+    }).await;
+    let catalog = app.try_state::<Arc<catalog::Catalog>>();
+    let server = async {
+        let name = "Telegram · выбранный сервер MTProto";
+        let Some(catalog) = catalog else {
+            return diag::check(name, "Проверка недоступна", "Каталог не запущен.");
+        };
+        let sample = match catalog.diagnose_selected().await {
+            Ok(Some(sample)) => sample,
+            Ok(None) => return diag::check(name, "Сервер не выбран", "Выберите сервер на вкладке Telegram."),
+            Err(error) => return diag::Check { name, status: "Проверка не завершена", detail: error },
+        };
+        let (status, detail) = match sample.result.as_str() {
+            "ok" => ("Связь подтверждена", "Выбранный сервер прошёл свежую проверку MTProto. Работа настольного клиента проверяется отдельно."),
+            "dns" => ("Ошибка DNS", "Имя выбранного сервера не удалось разрешить."),
+            "address" => ("Адрес отклонён", "Источник вернул адрес, который нельзя безопасно проверить."),
+            "timeout" if sample.tcp.is_some() => ("Таймаут MTProto", "TCP-соединение установилось, но проверка протокола не завершилась."),
+            "timeout" => ("Таймаут TCP", "Выбранный сервер не ответил при подключении к порту."),
+            "protocol" => ("Ошибка MTProto", "Сервер ответил по TCP, но проверку MTProto не прошёл."),
+            _ => ("Соединение не подтверждено", "Не удалось подключиться к выбранному серверу. Повторите проверку или выберите другой сервер."),
+        };
+        diag::check(name, status, detail)
+    };
+    let web = diag::https(diag::client().build(), "https://web.telegram.org/", "Telegram Web · прямой запрос");
+    let (server, web, proxy) = tokio::join!(server, web, diag::system_proxy());
+    report.checks.extend([
+        server, web,
+        diag::check("Telegram Desktop", "Ручная проверка", "Откройте Telegram Desktop и проверьте, загружаются ли чаты и медиа."),
+        proxy,
+    ]);
+    for check in &report.checks {
+        logs::info("app", format!("Сетевая диагностика · {} · {}", check.name, check.status));
+    }
+    report
+}
+
+#[tauri::command]
+async fn diag_close_listener(app: AppHandle, token: String) -> Result<bool, String> {
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let outcome = diag::close_listener(&token, &st.cfg().tgws);
+        match &outcome {
+            Ok(true) => logs::info("app", "Диагностика Telegram: после закрытия окна порт освобождён."),
+            Ok(false) => logs::warn("app", "Диагностика Telegram: запрос на закрытие отправлен, порт занят."),
+            Err(_) => logs::warn("app", "Диагностика Telegram: закрытие окна не выполнено."),
+        }
+        outcome
+    }).await
 }
 
 #[tauri::command]
@@ -896,6 +1002,7 @@ fn proxy_status() -> Result<proxy::ProxyState, String> {
 
 #[tauri::command]
 fn proxy_connect(app: AppHandle, state: State<'_, AppState>, kind: String, host: String, port: u16, bypass: String) -> Result<ConnectResult, String> {
+    let _maintenance = state.network_maintenance.try_lock().ok_or("Выполняется обслуживание сетевых компонентов.")?;
     let server = proxy::server_string(&kind, &host, port)?;
     let mut snap = state.snapshot.lock();
     if state.quitting.load(Ordering::SeqCst) {
@@ -1309,6 +1416,7 @@ pub fn run() {
             app_updater::app_update_check,
             app_updater::app_update_install,
             diag_run,
+            diag_close_listener,
             diag_open,
             proxy_status,
             proxy_connect,

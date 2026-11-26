@@ -55,6 +55,8 @@ pub struct StrategyResult {
     pub services: BTreeMap<String, (usize, usize)>,
     pub score: f64,
     pub rechecked: bool,
+    #[serde(default)]
+    pub startup_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -243,16 +245,33 @@ fn better(a: &StrategyResult, b: &StrategyResult) -> std::cmp::Ordering {
         .then(a.latency_ms.unwrap_or(u32::MAX).cmp(&b.latency_ms.unwrap_or(u32::MAX)))
 }
 
+fn routed_vpn(adapters: &[win::Adapter], route_index: u32) -> Option<String> {
+    let adapter = adapters.iter().find(|a| a.up && a.ipv4_index == route_index)?;
+    let label = format!("{} ({})", adapter.name, adapter.description);
+    let lower = label.to_ascii_lowercase();
+    let vpn = ["wireguard", "wintun", "tap-windows", "openvpn", "vpn", "outline", "amnezia", "happ", "hiddify", "nekoray", "clash", "v2ray", "sing-box", "xray", "zerotier", "tailscale"];
+    if lower.contains("teredo") || adapter.if_type == 24 || !vpn.iter().any(|name| lower.contains(name)) {
+        return None;
+    }
+    Some(if adapter.description.is_empty() { adapter.name.clone() } else { label })
+}
+
 pub fn detect_vpn() -> Option<String> {
-    let re = ["wireguard", "wintun", "tap-windows", "openvpn", "vpn", "tun", "outline", "amnezia", "happ", "hiddify", "nekoray", "clash", "v2ray", "sing-box", "xray", "zerotier", "tailscale", "radmin"];
-    win::adapters()
-        .into_iter()
-        .filter(|a| a.up && a.if_type != 24)
-        .find(|a| {
-            let n = format!("{} {}", a.name, a.description).to_ascii_lowercase();
-            re.iter().any(|k| n.contains(k)) && !n.contains("radmin") // Radmin VPN is a LAN tool; it does not tunnel internet traffic
-        })
-        .map(|a| if a.description.is_empty() { a.name } else { format!("{} ({})", a.name, a.description) })
+    use windows_sys::Win32::NetworkManagement::IpHelper::GetBestInterface;
+    // Look up a public IPv4 route without sending packets or changing routes.
+    let mut index = 0;
+    let status = unsafe { GetBestInterface(u32::from_ne_bytes([1, 1, 1, 1]), &mut index) };
+    if status != 0 || index == 0 {
+        return None;
+    }
+    routed_vpn(&win::adapters(), index)
+}
+
+fn unconfirmed_services(report: &Report) -> Vec<String> {
+    report.blocked.iter().filter(|service| {
+        let mut results = report.results.values().filter_map(|result| result.services.get(*service)).peekable();
+        results.peek().is_some() && results.all(|(ok, _)| *ok == 0)
+    }).cloned().collect()
 }
 
 pub fn run(app: AppHandle, tester: Arc<Tester>, zap: Arc<Component>, resources: PathBuf, cfg: ZapretConfig) -> Result<(), String> {
@@ -347,7 +366,7 @@ pub fn run(app: AppHandle, tester: Arc<Tester>, zap: Arc<Component>, resources: 
                 emit(Progress { phase: "recheck", current: n + 1, total: leaders.len(), strategy: Some(file.trim_end_matches(".bat").to_string()), message: None });
                 let again = test_one(&zap, &dir, file, &cfg, &baseline);
                 let merged = StrategyResult {
-                    status: if again.status == "passed" && first.status == "passed" { "passed".into() } else { "failed".into() },
+                    status: again.status.clone(),
                     opened: first.opened.min(again.opened),
                     blocked_total: first.blocked_total,
                     broken: first.broken.max(again.broken),
@@ -358,6 +377,7 @@ pub fn run(app: AppHandle, tester: Arc<Tester>, zap: Arc<Component>, resources: 
                     services: again.services.clone(),
                     score: (first.score + again.score) / 2.0,
                     rechecked: true,
+                    startup_error: again.startup_error.clone(),
                 };
                 report.results.insert(file.clone(), merged);
             }
@@ -374,12 +394,7 @@ pub fn run(app: AppHandle, tester: Arc<Tester>, zap: Arc<Component>, resources: 
                 .map(|(k, _)| (*k).clone())
                 .collect();
         }
-        report.unfixable = report
-            .blocked
-            .iter()
-            .filter(|svc| !report.results.values().any(|r| r.services.get(*svc).is_some_and(|(ok, _)| *ok > 0)))
-            .cloned()
-            .collect();
+        report.unfixable = unconfirmed_services(&report);
         report.cancelled = cancelled;
         report.duration_ms = started.elapsed().as_millis() as u64;
         tester.save(&report);
@@ -398,16 +413,74 @@ pub fn run(app: AppHandle, tester: Arc<Tester>, zap: Arc<Component>, resources: 
 
 fn test_one(zap: &Arc<Component>, dir: &Path, file: &str, cfg: &ZapretConfig, baseline: &[Probe]) -> StrategyResult {
     let _guard = zap.op.lock();
-    let launched = zapret::launch(zap, dir, file, cfg, true);
-    let ready = launched.is_ok() && zapret::wait_ready(zap, Duration::from_millis(2000)).is_ok() && zap.alive();
-    let result = if ready {
-        std::thread::sleep(WARMUP);
-        evaluate(baseline, &probe_all())
-    } else {
-        StrategyResult { status: "not_started".into(), blocked_total: baseline.iter().filter(|b| !b.ok).count(), ..Default::default() }
+    let readiness = zapret::launch(zap, dir, file, cfg, true)
+        .and_then(|_| zapret::wait_ready(zap, Duration::from_millis(2000)));
+    let result = match readiness {
+        Ok(capture_ready) => {
+            std::thread::sleep(WARMUP);
+            if !capture_ready && !matches!(zap.health(), crate::component::Health::Ready) {
+                failed_start(file, baseline, "WinDivert не подтвердил готовность.", zap.tail())
+            } else if zap.alive() {
+                let probes = probe_all();
+                if zap.alive() {
+                    evaluate(baseline, &probes)
+                } else {
+                    failed_start(file, baseline, "winws.exe завершился во время проверки.", zap.tail())
+                }
+            } else {
+                failed_start(file, baseline, "winws.exe завершился перед проверкой.", zap.tail())
+            }
+        }
+        Err(error) => failed_start(file, baseline, "Не удалось запустить стратегию.", error),
     };
     zap.kill();
     zap.mark_stopped();
     std::thread::sleep(Duration::from_millis(350));
     result
+}
+
+fn failed_start(file: &str, baseline: &[Probe], message: &str, detail: String) -> StrategyResult {
+    let detail = logs::redact(detail.trim());
+    logs::warn("test", format!("{file}: {message} {detail}"));
+    StrategyResult {
+        status: "not_started".into(),
+        blocked_total: baseline.iter().filter(|probe| !probe.ok).count(),
+        startup_error: Some(if detail.is_empty() { message.into() } else { format!("{message} {detail}") }),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn adapter(name: &str, ipv4_index: u32, up: bool) -> win::Adapter {
+        win::Adapter { name: name.into(), description: String::new(), ipv4_index, up, if_type: 131, mtu: 1500 }
+    }
+
+    #[test]
+    fn vpn_requires_active_matching_route_and_excludes_teredo() {
+        let adapters = [
+            adapter("Microsoft Teredo Tunneling Adapter", 3, true),
+            adapter("WireGuard VPN", 5, true),
+            adapter("Office VPN", 7, false),
+        ];
+        assert_eq!(routed_vpn(&adapters, 5).as_deref(), Some("WireGuard VPN"));
+        for index in [3, 7, 9] {
+            assert_eq!(routed_vpn(&adapters, index), None);
+        }
+    }
+
+    #[test]
+    fn failed_start_cannot_establish_service_unavailability() {
+        let service = "Discord".to_string();
+        let mut report = Report { blocked: vec![service.clone()], ..Default::default() };
+        report.results.insert("general".into(), StrategyResult { status: "not_started".into(), ..Default::default() });
+        assert!(unconfirmed_services(&report).is_empty());
+        report.results.insert("another".into(), StrategyResult {
+            services: BTreeMap::from([(service.clone(), (0, 1))]),
+            ..Default::default()
+        });
+        assert_eq!(unconfirmed_services(&report), vec![service]);
+    }
 }

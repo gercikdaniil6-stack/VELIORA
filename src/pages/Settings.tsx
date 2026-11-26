@@ -1,3 +1,4 @@
+import { Channel } from '@tauri-apps/api/core';
 import { useState } from 'react';
 import { BrandLogo } from '../brand/BrandLogo';
 import type { Route } from '../components/Sidebar';
@@ -21,6 +22,7 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
   const { appearance } = useAppearance();
   const themeName = appearance.theme === 'system' ? 'System' : appearance.theme === 'custom' ? 'Своя тема' : THEME_BY_ID[appearance.theme]?.name;
   const [confirm, setConfirm] = useState<null | 'reset' | 'restart'>(null);
+  const [resetStage, setResetStage] = useState('');
   const [checking, setChecking] = useState(false);
 
   const set = (patch: Partial<AppPrefs>) => core.save((c) => ({ ...c, app: { ...c.app, ...patch } }), { quiet: true }).then((ok) => { if (ok) core.refreshInfo(); });
@@ -42,12 +44,18 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
   };
 
   const reset = async () => {
+    if (resetStage) return;
+    setResetStage('Начинаем сброс');
     try {
+      const result = await api.configFactoryReset(new Channel<string>(setResetStage));
       if (proxy.conn.phase === 'connected') await proxy.disconnect();
-      await api.configFactoryReset();
-      toast.show({ tone: 'ok', title: 'Настройки сброшены', body: 'Ключ Telegram-прокси новый — подключите прокси в Telegram заново.' });
+      const connection = result.online ? 'Контрольный HTTPS-запрос прошёл.' : 'Интернет не подтверждён контрольным запросом.';
+      const conflicts = result.possibleConflicts ? ' Есть возможные конфликты. Проверьте диагностику на главной.' : '';
+      toast.show({ tone: result.online ? 'ok' : 'error', title: 'Настройки VELIORA сброшены', body: connection + conflicts + ' Настройте подключение заново.', ms: 9000 });
     } catch (e) {
       toast.show({ tone: 'error', title: 'Сброс выполнен не полностью', body: (e as Error).message });
+    } finally {
+      setResetStage('');
     }
   };
 
@@ -132,8 +140,8 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
               <button className="btn" onClick={() => setConfirm('restart')}>Перезапустить</button>
             </div>
             <div className="setting">
-              <div><div className="setting__title">Заводские настройки</div><div className="setting__desc">Сменит ключ Telegram, сбросит стратегию, тест и настройки обхода. Списки Zapret и профили прокси сохранятся.</div></div>
-              <button className="btn btn--danger" onClick={() => setConfirm('reset')}>Сбросить…</button>
+              <div><div className="setting__title">Полный сброс и восстановление сети</div><div className="setting__desc">Остановит подключения VELIORA и восстановит прежний системный прокси. Списки, темы и профили сохранятся.</div></div>
+              <button className="btn btn--danger" disabled={Boolean(resetStage)} onClick={() => setConfirm('reset')}>Сбросить…</button>
             </div>
             <div className="setting">
               <div><div className="setting__title">Выйти из VELIORA App</div><div className="setting__desc">Остановит прокси и Zapret, восстановит прежние настройки Windows.</div></div>
@@ -143,8 +151,9 @@ export function Settings({ onNavigate }: { onNavigate: (r: Route) => void }) {
         </div>
       </div>
 
-      <Confirm open={confirm === 'reset'} onClose={() => setConfirm(null)} title="Сбросить к заводским настройкам?" confirm="Сбросить" danger
-        body="Сбросятся настройки приложения, выбранная стратегия, результаты теста и настройки обхода. Будет создан новый ключ Telegram-прокси — ссылку придётся добавить в Telegram заново." onConfirm={reset} />
+      {resetStage && <div className="banner glass" role="status"><Spinner size={16} /> {resetStage}…</div>}
+      <Confirm open={confirm === 'reset'} onClose={() => setConfirm(null)} title="Выполнить полный сброс и восстановление сети?" confirm="Сбросить" danger
+        body="Подключения VELIORA остановятся. Прежний системный прокси Windows будет восстановлен из точки восстановления VELIORA. Настройки запуска и стратегии сбросятся, а для локального Telegram-прокси будет создан новый ключ." onConfirm={reset} />
       <Confirm open={confirm === 'restart'} onClose={() => setConfirm(null)} title="Перезапустить VELIORA App?" confirm="Перезапустить"
         body="Приложение закроется и откроется снова." onConfirm={() => api.restart().catch((e) => toast.show({ tone: 'error', title: 'Не удалось перезапустить', body: e.message }))} />
     </div>

@@ -71,6 +71,7 @@ struct Activity {
     remaining: u8,
     last_refresh: i64,
     last_scan: i64,
+    diagnostic: Option<(i64, tokio::sync::oneshot::Sender<R<probe::Sample>>)>,
     handoff: Option<(i64, tokio::sync::oneshot::Sender<R<db::Target>>)>,
 }
 struct ActiveProxy {
@@ -241,6 +242,17 @@ impl Catalog {
                     db::pref(c, "feed_direct", 0)? != 0,
                 ))
             })?;
+            let request = self.run.lock().diagnostic.take();
+            if let Some((id, reply)) = request {
+                if !reply.is_closed() {
+                    let sample = match tester.as_mut() {
+                        Some(tester) => self.with(|db| db::endpoint(db, id))
+                            .map(|endpoint| tester.check(&endpoint, false)),
+                        None => Err("Проверка MTProto недоступна.".into()),
+                    };
+                    let _ = reply.send(sample);
+                }
+            }
             let manual = self.run.lock().refresh;
             let latest_due = t >= next_latest || manual;
             let archive_due = before > 0 && t >= next_history && t >= backoff;
@@ -345,6 +357,32 @@ impl Catalog {
     }
 }
 impl Catalog {
+    pub async fn diagnose_selected(&self) -> R<Option<probe::Sample>> {
+        let id = self.active.lock().await.as_ref().map(|active| active.target.id);
+        let id = match id {
+            Some(id) if id > 0 => id,
+            _ => self.with(|db| db::pref(db, "selected", 0))?,
+        };
+        if id == 0 {
+            return Ok(None);
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut run = self.run.lock();
+            if !run.test_error.is_empty() || self.stop.load(Ordering::Relaxed) {
+                return Err("Проверка MTProto сейчас недоступна.".into());
+            }
+            if run.diagnostic.as_ref().is_some_and(|(_, pending)| !pending.is_closed()) {
+                return Err("Проверка сервера уже в очереди.".into());
+            }
+            run.diagnostic = Some((id, send));
+        }
+        tokio::time::timeout(Duration::from_secs(20), receive).await
+            .map_err(|_| "Проверка не завершилась за 20 секунд.")?
+            .map_err(|_| "Проверку отменили.")?
+            .map(Some)
+    }
+
     pub fn status(&self) -> CoreStatus {
         self.status.lock().clone()
     }
@@ -428,6 +466,16 @@ impl Catalog {
             tx.commit().db()
         })
     }
+    pub async fn with_relay_stopped<T>(&self, app: &AppHandle, op: impl FnOnce() -> T) -> R<T> {
+        let mut active = self.active.try_lock().map_err(|_| "Подождите окончания переключения Telegram.")?;
+        if let Some(proxy) = active.take() {
+            self.publish(app, CoreStatus { state: "stopping", ..self.status() });
+            proxy.relay.close().await;
+        }
+        self.publish(app, CoreStatus::default());
+        Ok(op())
+    }
+
     pub async fn power(&self, app: &AppHandle, on: bool, id: i64) -> R<()> {
         let mut active = self
             .active

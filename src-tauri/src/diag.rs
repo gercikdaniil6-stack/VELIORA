@@ -33,12 +33,14 @@ pub struct DiagReport {
     pub issues: Vec<Issue>,
     pub passed: Vec<String>,
     pub admin: bool,
+    pub checks: Vec<Check>,
+    pub close_offer: Option<CloseOffer>,
 }
 
 pub struct Ctx<'a> {
     pub resources: &'a Path,
     pub tgws: &'a TgwsConfig,
-    pub tgws_running: bool,
+    pub tgws_pid: Option<u32>,
     pub own_proxy_active: bool,
     pub zapret_pid: Option<u32>,
 }
@@ -130,28 +132,39 @@ pub fn run(ctx: &Ctx) -> DiagReport {
         });
     }
 
-    // 4. Telegram port
-    if !ctx.tgws_running {
-        let addr = format!("{}:{}", ctx.tgws.host, ctx.tgws.port);
-        let free = std::net::TcpListener::bind(addr.as_str()).is_ok();
-        if free {
-            passed.push(format!("Порт Telegram-прокси {}", ctx.tgws.port));
-        } else {
-            issues.push(Issue {
-                id: "tgws-port",
-                severity: "error",
-                title: format!("Порт {} занят другой программой", ctx.tgws.port),
-                impact: "Не будет работать: Telegram-прокси.".into(),
-                detail: format!("Прокси должен слушать {addr}, но порт уже используется или зарезервирован Windows."),
-                steps: vec![
-                    "Проще всего — указать другой порт на странице Telegram (например, 1444) и заново добавить ссылку в Telegram.".into(),
-                    "Или найдите программу, которая заняла порт: первая команда покажет номер процесса (PID), вторая — его имя.".into(),
-                ],
-                commands: vec![format!("netstat -ano | findstr :{}", ctx.tgws.port), "tasklist /FI \"PID eq 1234\"".into()],
-                actions: vec![],
-            });
+    // Match a bind failure to the actual listener, rather than guessing a process.
+    let mut close_offer = None;
+    let port = match ctx.tgws.host.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            let address = std::net::SocketAddr::new(ip, ctx.tgws.port);
+            match std::net::TcpListener::bind(address) {
+                Ok(_) => check("Локальный Telegram-прокси", "Свободный порт",
+                    "Порт доступен для запуска. Связь с Telegram здесь не проверялась."),
+                Err(_) => {
+                    let pid = win::tcp_listener_owner(address);
+                    if pid.is_some() && pid == ctx.tgws_pid {
+                        check("Локальный Telegram-прокси", "Свой слушатель",
+                            "Порт слушает процесс VELIORA. Это подтверждает локальный запуск.")
+                    } else if let Some(pid) = pid {
+                        if let Some(window) = win::closable_window(pid) {
+                            close_offer = Some(register_close(address, window));
+                        }
+                        let process = win::process_path(pid).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+                        Check {
+                            name: "Локальный Telegram-прокси",
+                            status: "Конфликт порта",
+                            detail: format!("Порт {} занят: {}. Закройте приложение вручную или смените порт Telegram-прокси.", ctx.tgws.port, process.unwrap_or_else(|| format!("владелец не определён (PID {pid})"))),
+                        }
+                    } else {
+                        check("Локальный Telegram-прокси", "Порт недоступен",
+                            "Windows не разрешила занять порт. Подтвердить владельца не удалось. Проверьте настройки или смените порт.")
+                    }
+                }
+            }
         }
-    }
+        Err(_) => check("Локальный Telegram-прокси", "Адрес не проверен",
+            "Для определения владельца порта нужен IP-адрес локального слушателя."),
+    };
 
     let services = win::services_all();
     // 5. Other bypass tools
@@ -160,8 +173,8 @@ pub fn run(ctx: &Ctx) -> DiagReport {
         passed.push("Другие программы обхода".into());
     } else {
         issues.push(Issue {
-            id: "conflict", severity: "error",
-            title: "Обнаружена другая сетевая программа".into(),
+            id: "conflict", severity: "warn",
+            title: "Возможен конфликт сетевых программ".into(),
             impact: "Она может использовать тот же механизм фильтрации.".into(),
             detail: {
                 let processes = conflicts.iter().map(|item| format!("{} (PID {})", item.label, item.pid)).collect::<Vec<_>>().join(", ");
@@ -178,13 +191,13 @@ pub fn run(ctx: &Ctx) -> DiagReport {
 
     // 6. VPN tunnel
     match tester::detect_vpn() {
-        None => passed.push("VPN-туннели".into()),
+        None => {}
         Some(name) => issues.push(Issue {
             id: "vpn",
             severity: "warn",
-            title: "Активен VPN-туннель".into(),
-            impact: "Работают некорректно: Zapret и тест стратегий.".into(),
-            detail: format!("Трафик идёт через виртуальный адаптер «{name}». Zapret обрабатывает пакеты до туннеля, а тест стратегий измеряет работу VPN, а не вашей сети."),
+            title: "Маршрут IPv4 через VPN-адаптер".into(),
+            impact: "Может повлиять на результаты сетевой диагностики.".into(),
+            detail: format!("Windows выбирает адаптер «{name}» для контрольного IPv4-адреса. Маршруты конкретных сервисов могут отличаться."),
             steps: vec!["Выключите туннель (TUN-режим) в VPN-программе.".into(), "Если VPN нужен одновременно с Zapret — просто учитывайте, что результаты теста не показательны.".into()],
             commands: vec![],
             actions: vec![Action { kind: "network", label: "Сетевые подключения" }],
@@ -257,7 +270,7 @@ pub fn run(ctx: &Ctx) -> DiagReport {
     }
 
     issues.sort_by_key(|i| if i.severity == "error" { 0 } else { 1 });
-    DiagReport { issues, passed, admin }
+    DiagReport { issues, passed, admin, checks: vec![port], close_offer }
 }
 
 /// Opens the Windows place a diagnostic step refers to (fixed list only).
@@ -272,4 +285,109 @@ pub fn open(kind: &str) -> Result<(), String> {
         _ => return Err("Неизвестное действие".into()),
     };
     win::shell_execute(None, file, params, None).map_err(|e| format!("Windows не открыла окно (код {e})"))
+}
+
+#[derive(Serialize)]
+pub struct Check {
+    pub name: &'static str,
+    pub status: &'static str,
+    pub detail: String,
+}
+
+pub fn check(name: &'static str, status: &'static str, detail: &str) -> Check {
+    Check { name, status, detail: detail.into() }
+}
+
+pub async fn https(client: Result<reqwest::Client, reqwest::Error>, target: &'static str, name: &'static str) -> Check {
+    let Ok(client) = client else {
+        return check(name, "Проверка недоступна", "Не удалось подготовить HTTPS-запрос.");
+    };
+    match client.get(target).send().await {
+        Ok(response) if response.status().is_success() => check(name, "HTTPS отвечает", "Контрольная страница вернула успешный HTTP-ответ."),
+        Ok(response) => Check { name, status: "Получена ошибка HTTP", detail: format!("Контрольный запрос: HTTP {}.", response.status().as_u16()) },
+        Err(error) if error.is_timeout() => check(name, "Таймаут", "Истекло время ожидания HTTPS-ответа."),
+        Err(error) if error.is_connect() => check(name, "Не удалось подключиться", "Проверьте сеть, DNS и настройки подключения."),
+        Err(_) => check(name, "Ошибка запроса", "Не удалось завершить контрольный HTTPS-запрос."),
+    }
+}
+
+pub fn client() -> reqwest::ClientBuilder {
+    use std::time::Duration;
+    reqwest::Client::builder().no_proxy().connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(6)).redirect(reqwest::redirect::Policy::none())
+}
+
+pub async fn system_proxy() -> Check {
+    const NAME: &str = "Системный прокси Windows";
+    let Ok(settings) = crate::proxy::read() else {
+        return check(NAME, "Настройки недоступны", "Не удалось прочитать параметры Windows.");
+    };
+    if !settings.enabled {
+        return check(NAME, "Отключён", "Windows не использует вручную заданный прокси. Сохранённые профили не проверялись.");
+    }
+    let Some(config) = settings.server else {
+        return check(NAME, "Адрес отсутствует", "Windows сообщила, что прокси включён, но адрес сервера не задан.");
+    };
+    let (scheme, addr) = if let Some(addr) = config.strip_prefix("socks=") {
+        ("socks5h", addr)
+    } else if config.contains([';', '=']) {
+        return check(NAME, "Сложная конфигурация", "Настройки Windows прочитаны. Раздельные адреса для разных протоколов не проверялись.");
+    } else {
+        ("http", config.as_str())
+    };
+    let Ok(url) = reqwest::Url::parse(&format!("{scheme}://{addr}")) else {
+        return check(NAME, "Адрес некорректен", "Проверьте адрес и порт в параметрах Windows.");
+    };
+    if url.host().is_none() || !url.username().is_empty() || url.password().is_some()
+        || url.path().trim_matches('/').len() > 0 || url.query().is_some() || url.fragment().is_some() {
+        return check(NAME, "Адрес не проверен", "Ожидается адрес прокси без пути и учётных данных.");
+    }
+    let Ok(proxy) = reqwest::Proxy::all(url) else {
+        return check(NAME, "Формат не поддерживается", "Не удалось подготовить контрольный запрос через этот прокси.");
+    };
+    https(client().proxy(proxy).build(), "https://www.microsoft.com/", NAME).await
+}
+
+#[derive(Serialize)]
+pub struct CloseOffer {
+    token: String,
+    label: &'static str,
+}
+
+struct CloseTarget {
+    token: String,
+    address: std::net::SocketAddr,
+    window: win::ClosableWindow,
+    observed: std::time::Instant,
+}
+
+static CLOSE_TARGET: parking_lot::Mutex<Option<CloseTarget>> = parking_lot::const_mutex(None);
+
+fn register_close(address: std::net::SocketAddr, window: win::ClosableWindow) -> CloseOffer {
+    let token = win::random_hex(16);
+    let label = window.label;
+    *CLOSE_TARGET.lock() = Some(CloseTarget { token: token.clone(), address, window, observed: std::time::Instant::now() });
+    CloseOffer { token, label }
+}
+
+pub fn close_listener(token: &str, config: &TgwsConfig) -> Result<bool, String> {
+    let target = {
+        let mut pending = CLOSE_TARGET.lock();
+        if !pending.as_ref().is_some_and(|offer| offer.token == token && offer.observed.elapsed().as_secs() < 90) {
+            return Err("Диагностика устарела. Повторите проверку.".into());
+        }
+        pending.take().expect("checked above")
+    };
+    if config.port != target.address.port() || config.host.parse::<std::net::IpAddr>().ok() != Some(target.address.ip()) {
+        return Err("Настройки Telegram-прокси изменились. Повторите проверку.".into());
+    }
+    win::request_listener_close(target.address, &target.window)?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    while std::time::Instant::now() < until {
+        if std::net::TcpListener::bind(target.address).is_ok() {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(160));
+    }
+    Ok(false)
 }

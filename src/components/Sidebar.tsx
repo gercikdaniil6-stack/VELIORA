@@ -13,6 +13,8 @@ const MAIN: Item[] = [
   { id: 'telegram', label: 'Telegram', icon: 'telegram' },
 ];
 const APP: Item[] = [
+  { id: 'appearance', label: 'Оформление', icon: 'palette' },
+  { id: 'logs', label: 'Журнал', icon: 'logs' },
   { id: 'settings', label: 'Настройки', icon: 'settings' },
 ];
 
@@ -28,7 +30,7 @@ export function Sidebar({ route, onNavigate }: { route: Route; onNavigate: (r: R
   useLayoutEffect(() => {
     const measure = () => {
       const el = nav.current?.querySelector<HTMLElement>(`[data-route="${route}"]`);
-      if (el) setPill({ y: el.offsetTop, h: el.offsetHeight });
+      setPill(el ? { y: el.offsetTop, h: el.offsetHeight } : null);
     };
     measure();
     const ro = new ResizeObserver(measure);

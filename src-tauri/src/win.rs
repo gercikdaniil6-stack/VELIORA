@@ -454,6 +454,7 @@ pub fn service_file(binary: &str) -> PathBuf {
 
 #[derive(Debug, Clone)]
 pub struct Adapter {
+    pub ipv4_index: u32,
     pub name: String,
     pub description: String,
     pub up: bool,
@@ -478,6 +479,7 @@ pub fn adapters() -> Vec<Adapter> {
         while !p.is_null() {
             let a = unsafe { &*p };
             out.push(Adapter {
+                ipv4_index: unsafe { a.Anonymous1.Anonymous.IfIndex },
                 name: unsafe { from_wide_ptr(a.FriendlyName) },
                 description: unsafe { from_wide_ptr(a.Description) },
                 up: a.OperStatus == 1,
@@ -630,6 +632,159 @@ pub fn protected_tree(root: &Path) -> std::io::Result<()> {
     if meta.is_dir() {
         for child in std::fs::read_dir(root)? {
             protected_tree(&child?.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns a unique overlapping TCP listener. Unknown or ambiguous ownership stays unknown.
+pub fn tcp_listener_owner(address: std::net::SocketAddr) -> Option<u32> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
+        TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    fn rows<T: Copy>(family: u16) -> Option<Vec<T>> {
+        let mut size = 0;
+        for _ in 0..4 {
+            let mut table = vec![0_u32; (size as usize).div_ceil(4)];
+            let data = if table.is_empty() { std::ptr::null_mut() } else { table.as_mut_ptr().cast() };
+            let status = unsafe {
+                GetExtendedTcpTable(data, &mut size, 0, family.into(), TCP_TABLE_OWNER_PID_LISTENER, 0)
+            };
+            match status {
+                122 if size <= 4 * 1024 * 1024 => continue,
+                0 if !table.is_empty() => {
+                    let count = table[0] as usize;
+                    if count > (table.len() * 4 - 4) / std::mem::size_of::<T>() {
+                        return None;
+                    }
+                    let base = unsafe { table.as_ptr().add(1).cast::<T>() };
+                    return Some((0..count).map(|i| unsafe { base.add(i).read_unaligned() }).collect());
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    let mut owners = std::collections::BTreeSet::new();
+    match address {
+        SocketAddr::V4(address) => {
+            for row in rows::<MIB_TCPROW_OWNER_PID>(AF_INET)? {
+                let ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+                if u16::from_be(row.dwLocalPort as u16) == address.port()
+                    && (ip.is_unspecified() || address.ip().is_unspecified() || ip == *address.ip())
+                {
+                    owners.insert(row.dwOwningPid);
+                }
+            }
+        }
+        SocketAddr::V6(address) => {
+            for row in rows::<MIB_TCP6ROW_OWNER_PID>(AF_INET6)? {
+                let ip = Ipv6Addr::from(row.ucLocalAddr);
+                if u16::from_be(row.dwLocalPort as u16) == address.port()
+                    && (ip.is_unspecified() || address.ip().is_unspecified()
+                        || (ip == *address.ip() && row.dwLocalScopeId == address.scope_id()))
+                {
+                    owners.insert(row.dwOwningPid);
+                }
+            }
+        }
+    }
+    if owners.len() == 1 { owners.pop_first().filter(|pid| *pid != 0) } else { None }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    #[test]
+    fn reports_listener_pid_only_for_matching_address() {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        assert_eq!(super::tcp_listener_owner(address), Some(std::process::id()));
+        let different = std::net::SocketAddr::from(([127, 0, 0, 2], address.port()));
+        assert_eq!(super::tcp_listener_owner(different), None);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosableWindow {
+    pid: u32,
+    started: u64,
+    path: PathBuf,
+    hwnd: usize,
+    pub label: &'static str,
+}
+
+pub fn closable_window(pid: u32) -> Option<ClosableWindow> {
+    use windows_sys::Win32::Foundation::{FILETIME, HWND, LPARAM, TRUE};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, GW_OWNER,
+    };
+
+    struct Search { pid: u32, hwnd: usize, count: u32 }
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> i32 {
+        let search = unsafe { &mut *(param as *mut Search) };
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == search.pid && IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER).is_null() {
+                search.hwnd = hwnd as usize;
+                search.count += 1;
+            }
+        }
+        TRUE
+    }
+
+    // Keep the automatic action restricted to known desktop applications
+    // installed at protected paths. Other listeners can be diagnosed manually.
+    let program_files = known_folder(&FOLDERID_ProgramFiles)?;
+    let path = process_path(pid)?.canonicalize().ok()?;
+    let label = [
+        (r"VideoLAN\VLC\vlc.exe", "VLC"),
+        (r"OBS Studio\bin\64bit\obs64.exe", "OBS Studio"),
+        (r"Microsoft VS Code\Code.exe", "Visual Studio Code"),
+    ].into_iter().find_map(|(relative, name)|
+        program_files.join(relative).canonicalize().ok().filter(|expected| *expected == path).map(|_| name))?;
+
+    let started = unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() { return None; }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exit = std::mem::zeroed();
+        let mut kernel = std::mem::zeroed();
+        let mut user = std::mem::zeroed();
+        let read = GetProcessTimes(process, &mut created, &mut exit, &mut kernel, &mut user);
+        CloseHandle(process);
+        if read == 0 { return None; }
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+    };
+    let mut search = Search { pid, hwnd: 0, count: 0 };
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM); }
+    (search.count == 1).then_some(ClosableWindow { pid, started, path, hwnd: search.hwnd, label })
+}
+
+pub fn request_listener_close(address: std::net::SocketAddr, target: &ClosableWindow) -> Result<(), &'static str> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, PostMessageW, WM_CLOSE};
+    if tcp_listener_owner(address) != Some(target.pid) || closable_window(target.pid).as_ref() != Some(target) {
+        return Err("Владелец порта или окно изменились. Диагностика обновлена.");
+    }
+    let hwnd = target.hwnd as HWND;
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != target.pid {
+            return Err("Окно изменилось. Диагностика обновлена.");
+        }
+        if PostMessageW(hwnd, WM_CLOSE, 0, 0) == 0 {
+            return Err("Windows не разрешила закрыть окно. Закройте программу вручную.");
         }
     }
     Ok(())

@@ -9,9 +9,13 @@ export function Diagnostics({ open, onClose }: { open: boolean; onClose: () => v
   const toast = useToast();
   const [report, setReport] = useState<DiagReport | null>(null);
   const [running, setRunning] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [closeResult, setCloseResult] = useState('');
   const [index, setIndex] = useState(0);
 
   const run = async () => {
+    setConfirmClose(false);
     setRunning(true);
     try {
       const r = await api.diagRun();
@@ -30,6 +34,22 @@ export function Diagnostics({ open, onClose }: { open: boolean; onClose: () => v
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  const close = async () => {
+    if (!report?.closeOffer || closing || running) return;
+    setClosing(true);
+    setConfirmClose(false);
+    try {
+      const released = await api.diagCloseListener(report.closeOffer.token);
+      setCloseResult(released ? 'Порт освободился. Теперь можно запустить Telegram-прокси.'
+        : 'Запрос на закрытие отправлен, но порт ещё занят. Проверьте окно программы или закройте её вручную.');
+    } catch (error) {
+      setCloseResult((error as Error).message);
+    } finally {
+      await run();
+      setClosing(false);
+    }
+  };
+
   const issue = report?.issues[index];
   const act = async (kind: string) => {
     try {
@@ -45,17 +65,38 @@ export function Diagnostics({ open, onClose }: { open: boolean; onClose: () => v
       lead="VELIORA проверяет систему и объясняет каждую найденную проблему с пошаговой инструкцией."
       foot={<>
         <button className="btn btn--ghost" onClick={onClose}>Закрыть</button>
-        <button className="btn" onClick={run} disabled={running}>{running ? <Spinner size={14} /> : <Icon name="refresh" size={16} />} Проверить снова</button>
+        <button className="btn" onClick={() => { setCloseResult(''); void run(); }} disabled={running || closing}>{running ? <Spinner size={14} /> : <Icon name="refresh" size={16} />} Проверить снова</button>
       </>}>
       {running && !report && <><div className="diag-wait"><Spinner size={18} /> Проверяю систему…</div><Skeleton rows={3} height={38} /></>}
       {report && report.issues.length === 0 && (
         <div className="diag-ok">
           <span className="diag-ok__icon"><Icon name="check" size={22} /></span>
           <div>
-            <div className="diag-ok__title">Проблем не найдено</div>
+            <div className="diag-ok__title">Системных предупреждений нет</div>
             <div className="muted">Проверено: {report.passed.join(', ')}.</div>
           </div>
         </div>
+      )}
+      {report && report.checks.length > 0 && (
+        <section aria-label="Проверки подключения" className="diag">
+          <h3 className="diag__title">Проверки подключения</h3>
+          {closeResult && <div className="note" role="status">{closeResult}</div>}
+          {report.checks.map((check) => (
+            <div key={check.name} className="note">
+              <div><strong>{check.name} · {check.status}</strong><div className="muted">{check.detail}</div></div>
+            </div>
+          ))}
+          {report.closeOffer && (confirmClose ? (
+            <div className="note">
+              <div>
+                <strong>Закрыть {report.closeOffer.label}?</strong>
+                <div className="muted">Сначала сохраните работу в этой программе.</div>
+                <button className="btn btn--ghost" onClick={() => setConfirmClose(false)}>Отмена</button>
+                <button className="btn btn--primary" onClick={() => void close()}>Подтвердить закрытие</button>
+              </div>
+            </div>
+          ) : <button className="btn" disabled={running || closing} onClick={() => setConfirmClose(true)}>Закрыть программу и проверить снова</button>)}
+        </section>
       )}
       {issue && (
         <div className="diag">
